@@ -21,6 +21,8 @@ def do_ipf(Z, u, v, start_iter=0, num_iter=100, row_factors=None, col_factors=No
     v: target col marginals
     """
     assert Z.shape == (len(u), len(v))
+    if not np.isclose(np.sum(u), np.sum(v)):
+        print('Warning: total row marginals do not equal total col marginals')
     # this allows us to continue from an earlier stopped iteration
     if start_iter > 0:
         assert row_factors is not None and col_factors is not None
@@ -145,6 +147,55 @@ def test_ipf_convergence_from_choice_sets(A, p, q, sort_items=False, apportion_s
     strongly_conected = nx.is_strongly_connected(G)
     print('Comparison graph is strongly connected:', strongly_conected)
     return G
+
+def test_ipf_convergence_from_max_flow(A, p, q):
+    """
+    Test whether IPF will converge via max flow algorithm.
+    From networkx documentation: "Edges of the graph are expected to have 
+    an attribute called ‘capacity’. If this attribute is not present, the edge 
+    is considered to have infinite capacity."
+    """
+    assert np.isclose(np.sum(p), np.sum(q))
+    G = nx.DiGraph()
+    # add edges from source to row nodes with capacity p
+    G.add_node('source')
+    row_nodes = np.arange(len(p))
+    G.add_nodes_from(row_nodes)
+    edges = list(zip(['source'] * len(p), row_nodes))
+    G.add_edges_from(edges)
+    capacities = dict(zip(edges, p))
+    nx.set_edge_attributes(G, name='capacity', values=capacities)
+    
+    # add edges from column nodes to sink with capacity q
+    G.add_node('sink')
+    col_nodes = np.arange(len(q)) + len(p)
+    G.add_nodes_from(col_nodes)
+    edges = list(zip(col_nodes, ['sink'] * len(q)))
+    G.add_edges_from(edges)
+    capacities = dict(zip(edges, q))
+    nx.set_edge_attributes(G, name='capacity', values=capacities)
+    
+    # add edges between row and column nodes with infinite capacity
+    nnz_row, nnz_col = np.nonzero(A)
+    edges = zip(row_nodes[nnz_row], col_nodes[nnz_col])
+    G.add_edges_from(edges)
+    print('Constructed graph for max flow')
+    
+    # do maximum flow
+    ts = time.time()
+    f_val, f_dict = nx.maximum_flow(G, 'source', 'sink')
+    print('Finished computing max flow [time=%.2fs]' % (time.time()-ts))
+    print('Flow value = %.3f, marginal total = %.3f -> equal = %s' % (
+        f_val, np.sum(p), np.isclose(f_val, np.sum(p))))
+    return G, f_val, f_dict
+
+def test_ipf_convergence_from_row_subsets(A, p, q):
+    """
+    Test whether IPF will converge by testing row subsets and their corresponding
+    columns. This is not an efficient way to test for convergence, but explains more
+    directly which constraint is getting violated 
+    """
+    pass
 
 
 ####################################################################
