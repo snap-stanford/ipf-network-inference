@@ -3,6 +3,7 @@ from model_experiments import fit_disease_model_on_real_data
 
 import argparse
 import datetime
+import os
 import numpy as np
 import networkx as nx
 from networkx.algorithms import bipartite
@@ -455,21 +456,41 @@ def run_ipf_experiment(msa_name, dt, msa_df_date_range, max_iter=1000):
                                           m.CBG_SIZES, m.POI_CBG_PROPORTIONS.toarray(), dt.hour)
     print('Date: %s, marginals prop positive -> POIs = %.3f, CBGs = %.3f' % (
         dt.strftime('%Y-%m-%d-%H'), np.mean(u > 0), np.mean(v > 0)))
+    ts = time.time()
     ipf_out = do_ipf(Z, u, v, num_iter=max_iter)
+    print('Finished IPF: time=%.2fs' % (time.time()-ts))
     fn = '%s_%s.pkl' % (msa_name, dt.strftime('%Y-%m-%d-%H'))
     print('Saving results in', fn)
     with open(fn, 'wb') as f:
         pickle.dump(ipf_out, f)
+        
+        
+def run_all_hours_in_day(msa_name, dt):
+    """
+    Outer function to run IPF for all hours in a given day.
+    """
+    print('Running IPF for %s, all hours on %s...' % (msa_name, dt.strftime('%Y-%m-%d')))
+    for hr in range(24):
+        curr_dt = datetime.datetime(year=dt.year, month=dt.month, day=dt.day, hour=hr)
+        out_file = '%s_%s.out' % (msa_name, curr_dt.strftime('%Y-%m-%d-%H'))
+        cmd = f'nohup python -u test_ipf.py {msa_name} --hour {hr} --mode inner > {out_file} 2>&1 &'
+        print(cmd)
+        os.system(cmd)
+        time.sleep(1)
     
     
 if __name__ == '__main__':
     # test_recoverable_process(sparsity_rate=0.8, seed=1)
     parser = argparse.ArgumentParser()
     parser.add_argument('msa_name', type=str)
-    parser.add_argument('hour', type=int)
+    parser.add_argument('--hour', default=12, type=int)
     parser.add_argument('--max_iter', type=int, default=1000)
+    parser.add_argument('--mode', default='outer', choices=['outer', 'inner'])
     args = parser.parse_args()
     
     dt = datetime.datetime(2020, 3, 1, args.hour)  # use March 1, 2020 for now
-    msa_df_date_range = '20191230_20200224'
-    run_ipf_experiment(args.msa_name, dt, msa_df_date_range, max_iter=args.max_iter)
+    if args.mode == 'outer':
+        run_all_hours_in_day(args.msa_name, dt)
+    else:
+        msa_df_date_range = '20191230_20200224'
+        run_ipf_experiment(args.msa_name, dt, msa_df_date_range, max_iter=args.max_iter)
