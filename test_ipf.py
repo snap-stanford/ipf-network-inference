@@ -575,75 +575,129 @@ def test_poisson_with_mobility_data(dt, method):
     fn = f'poisson-{method}.pkl'
     print('Will save results in', fn)
     mdl, result = run_poisson_experiment(X, p, q, Y=None, method=method)
+    print(result.summary())
+    with open(fn, 'wb') as f:
+        pickle.dump((result.params, result.conf_int(alpha=0.05), result.conf_int(alpha=0.1)))
     result.save(fn)
     
-def visualize_ipf_vs_poisson_params(row_factors, col_factors, result, log_ipf=True, with_cis=True):
+def visualize_ipf_vs_poisson_params(ipf_row_factors, ipf_col_factors, reg_coefs, reg_cis=None,
+                                    true_row_factors=None, true_col_factors=None, normalize=True,
+                                    log_ipf=False, xlim=None, ylim=None):
     """
     Plot IPF parameters vs Poisson regression parameters. If log_ipf is True, log transform IPF parameters.
     If log_ipf is False, exponentiate the Poisson regression parameters.
     """
-    coefs = result.params
-    cis = result.conf_int(alpha=0.05)
+    m, n = len(ipf_row_factors), len(ipf_col_factors)
+    reg_row_coefs = np.exp(reg_coefs[:m])
+    reg_row_cis = np.exp(reg_cis[:m]) if reg_cis is not None else None
+    reg_col_coefs = np.exp(reg_coefs[m:])
+    reg_col_cis = np.exp(reg_cis[m:]) if reg_cis is not None else None
+    if normalize:
+        # normalize all factors by their mean, so that we can compare at y=x
+        ipf_row_factors = ipf_row_factors / np.mean(ipf_row_factors)
+        ipf_col_factors = ipf_col_factors / np.mean(ipf_col_factors)
+        reg_row_cis = reg_row_cis / np.mean(reg_row_coefs) if reg_row_cis is not None else None
+        reg_row_coefs = reg_row_coefs / np.mean(reg_row_coefs)
+        reg_col_cis = reg_col_cis / np.mean(reg_col_coefs) if reg_col_cis is not None else None
+        reg_col_coefs = reg_col_coefs / np.mean(reg_col_coefs)
+        true_row_factors = true_row_factors / np.mean(true_row_factors) if true_row_factors is not None else None
+        true_col_factors = true_col_factors / np.mean(true_col_factors) if true_col_factors is not None else None
+    
     if log_ipf:
-        ipf_rows = np.log(row_factors)
-        ipf_cols = np.log(col_factors)
+        ipf_row_factors = np.log(ipf_row_factors)
+        ipf_col_factors = np.log(ipf_col_factors)
         ipf_row_label = '\log(d^0_i)'
         ipf_col_label = '\log(d^1_j)'
-        pois_rows = coefs[:len(row_factors)]
-        pois_rows_cis = cis[:len(row_factors)]
-        pois_cols = coefs[len(row_factors):]
-        pois_cols_cis = cis[len(row_factors):]
-        pois_row_label = '\\theta_i'
-        pois_col_label = '\\theta_j'
+        reg_row_coefs = np.log(reg_row_coefs)
+        reg_row_cis = np.log(reg_row_cis) if reg_row_cis is not None else None
+        reg_col_coefs = np.log(reg_col_coefs)
+        reg_col_cis = np.log(reg_col_cis) if reg_col_cis is not None else None
+        reg_row_label = '\\theta_i'
+        reg_col_label = '\\theta_j'
+        true_row_factors = np.log(true_row_factors) if true_row_factors is not None else None
+        true_col_factors = np.log(true_col_factors) if true_col_factors is not None else None    
+        true_row_label = 'u_i'
+        true_col_label = '-v_j'
     else:
-        ipf_rows = row_factors
-        ipf_cols = col_factors
         ipf_row_label = 'd^0_i'
         ipf_col_label = 'd^1_j'
-        pois_rows = np.exp(coefs[:len(row_factors)])
-        pois_rows_cis = np.exp(cis[:len(row_factors)])
-        pois_cols = np.exp(coefs[len(row_factors):])
-        pois_cols_cis = np.exp(cis[len(row_factors):])
-        pois_row_label = '\exp(\\theta_i)'
-        pois_col_label = '\exp(\\theta_j)'
+        reg_row_label = '\exp(\\theta_i)'
+        reg_col_label = '\exp(\\theta_j)'
+        true_row_label = '\exp(u_i)'
+        true_col_label = '\exp(-v_j)'
         
-    fig, axes = plt.subplots(1, 2, figsize=(11, 5))
+    fig, axes = plt.subplots(1, 2, figsize=(11, 5), sharex=True, sharey=True)
     fig.subplots_adjust(wspace=0.3)
+    # plot row params 
     ax = axes[0]
-    ax.scatter(ipf_rows, pois_rows)
-    if with_cis:
-        for i in range(len(ipf_rows)):
-            ax.plot([ipf_rows[i], ipf_rows[i]], [pois_rows_cis[i, 0], pois_rows_cis[i, 1]], 
+    ax.scatter(ipf_row_factors, reg_row_coefs, color='tab:blue')
+    if reg_row_cis is not None:
+        for i in range(m):
+            ax.plot([ipf_row_factors[i], ipf_row_factors[i]], [reg_row_cis[i, 0], reg_row_cis[i, 1]], 
                     color='grey', alpha=0.5)
     ax.set_xlabel(f'${ipf_row_label}$ from IPF', fontsize=12)
-    ax.set_ylabel(f'${pois_row_label}$ from Poisson regression', fontsize=12)
+    ax.set_ylabel(f'${reg_row_label}$ from Poisson regression', color='tab:blue', fontsize=12)
     ax.grid(alpha=0.2)
+    if normalize:
+        ax.plot(ipf_row_factors, ipf_row_factors, label='y=x')
+        ax.legend(loc='lower right')
+    if xlim is not None:
+        ax.set_xlim(xlim)
+    if ylim is not None:
+        ax.set_ylim(ylim)
+    
+    # plot column params
     ax = axes[1]
-    ax.scatter(ipf_cols, pois_cols)
-    if with_cis:
-        for j in range(len(ipf_cols)):
-            ax.plot([ipf_cols[j], ipf_cols[j]], [pois_cols_cis[j, 0], pois_cols_cis[j, 1]],
+    ax.scatter(ipf_col_factors, reg_col_coefs, color='tab:blue')
+    if reg_col_cis is not None:
+        for j in range(n):
+            ax.plot([ipf_col_factors[j], ipf_col_factors[j]], [reg_col_cis[j, 0], reg_col_cis[j, 1]],
                     color='grey', alpha=0.5)
     ax.set_xlabel(f'${ipf_col_label}$ from IPF', fontsize=12)
-    ax.set_ylabel(f'${pois_col_label}$ from Poisson regression', fontsize=12)
+    ax.set_ylabel(f'${reg_col_label}$ from Poisson regression', color='tab:blue', fontsize=12)
     ax.grid(alpha=0.2)
-    plt.show()
+    if normalize:
+        ax.plot(ipf_col_factors, ipf_col_factors, label='y=x')
+        ax.legend(loc='lower right')
+    if xlim is not None:
+        ax.set_xlim(xlim)
+    if ylim is not None:
+        ax.set_ylim(ylim)
+    
+    # add true scaling factors in orange
+    if true_row_factors is not None:
+        ax_twin = axes[0].twinx()
+        ax_twin.scatter(ipf_row_factors, true_row_factors, color='tab:orange', alpha=0.5)
+        ax_twin.set_ylabel(f'${true_row_label}$ from Poisson model', color='tab:orange', fontsize=12)
+        ax_twin.set_xlim(axes[0].get_xlim())
+        ax_twin.set_ylim(axes[0].get_ylim())
+    if true_col_factors is not None:
+        ax_twin = axes[1].twinx()
+        ax_twin.scatter(ipf_col_factors, true_col_factors, color='tab:orange', alpha=0.5)
+        ax_twin.set_ylabel(f'${true_col_label}$ from Poisson model', color='tab:orange', fontsize=12)
+        ax_twin.set_xlim(axes[1].get_xlim())
+        ax_twin.set_ylim(axes[1].get_ylim())
+    return fig, axes
 
     
 if __name__ == '__main__':
     # test_recoverable_process(sparsity_rate=0.8, seed=1)
-    parser = argparse.ArgumentParser()
-    parser.add_argument('msa_name', type=str)
-    parser.add_argument('--hour', default=12, type=int)
-    parser.add_argument('--max_iter', type=int, default=1000)
-    parser.add_argument('--mode', default='outer', choices=['outer', 'inner'])
-    args = parser.parse_args()
+#     parser = argparse.ArgumentParser()
+#     parser.add_argument('msa_name', type=str)
+#     parser.add_argument('--hour', default=12, type=int)
+#     parser.add_argument('--max_iter', type=int, default=1000)
+#     parser.add_argument('--mode', default='outer', choices=['outer', 'inner'])
+#     args = parser.parse_args()
     
-    # dt = datetime.datetime(2020, 3, 2, args.hour)
-    dt = datetime.datetime(2020, 4, 6, args.hour)  # same two days as in original paper
-    if args.mode == 'outer':
-        run_all_hours_in_day(args.msa_name, dt)
-    else:
-        # msa_df_date_range = '20191230_20200224'
-        msa_df_date_range = '20200302_20200608'
-        run_ipf_experiment(args.msa_name, dt, msa_df_date_range, max_iter=args.max_iter)
+#     # dt = datetime.datetime(2020, 3, 2, args.hour)
+#     dt = datetime.datetime(2020, 4, 6, args.hour)  # same two days as in original paper
+#     if args.mode == 'outer':
+#         run_all_hours_in_day(args.msa_name, dt)
+#     else:
+#         # msa_df_date_range = '20191230_20200224'
+#         msa_df_date_range = '20200302_20200608'
+#         run_ipf_experiment(args.msa_name, dt, msa_df_date_range, max_iter=args.max_iter)
+    
+    dt = datetime.datetime(2020, 3, 2, 12)
+    method = 'lbfgs'
+    test_poisson_with_mobility_data(dt, method)
