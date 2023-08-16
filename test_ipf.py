@@ -3,12 +3,15 @@ from model_experiments import fit_disease_model_on_real_data
 
 import argparse
 import datetime
-import os
-import numpy as np
+import matplotlib.pyplot as plt
 import networkx as nx
 from networkx.algorithms import bipartite
+import numpy as np
+import os
 import pickle
-from scipy.stats import pearsonr
+from scipy.sparse import csr_matrix
+from sklearn.linear_model import PoissonRegressor
+import statsmodels.api as sm
 import time
 
 ####################################################################
@@ -312,9 +315,67 @@ def test_unrecoverable_process():
 ####################################################################
 # Prepare SafeGraph data for IPF
 ####################################################################
-def prep_safegraph_data_for_ipf(poi_time_counts, cbg_day_prop_out, cbg_sizes, 
-                                poi_cbg_props, t):
+def prep_safegraph_data_for_ipf(msa_name, dt, msa_df_date_range):
     """
+    Prep SafeGraph data for IPF.
+    msa_name: name of metropolitan statistical area
+    dt: datetime object, with year, month, day, and hour
+    msa_df_date_range: SafeGraph data is stored per date range; this is the date range corresponding to this datetime
+    """
+    min_datetime = datetime.datetime(dt.year, dt.month, dt.day, 0)
+    max_datetime = datetime.datetime(dt.year, dt.month, dt.day, 23)
+    CBG_COUNT_CUTOFF = 100  # this doesn't matter since CBGs are prespecified
+    POI_HOURLY_VISITS_CUTOFF = 'all'  # same, doesn't matter
+    poi_ids = helper.load_poi_ids_for_msa(msa_name)
+    cbg_ids = helper.load_cbg_ids_for_msa(msa_name)
+    print('Loaded %d POI and %d CBG ids' % (len(poi_ids), len(cbg_ids)))
+    msa_df = helper.prep_msa_df_for_model_experiments(msa_name, [msa_df_date_range])
+    m = fit_disease_model_on_real_data(d=msa_df,
+                                       min_datetime=min_datetime,
+                                       max_datetime=max_datetime,
+                                       msa_name=msa_name,
+                                       exogenous_model_kwargs={'poi_psi':1, 
+                                                               'home_beta':1, 
+                                                               'p_sick_at_t0':0,  # don't need infections
+                                                               'just_compute_r0':False},
+                                       poi_attributes_to_clip={'clip_areas':True, 
+                                                               'clip_dwell_times':True, 
+                                                               'clip_visits':True},
+                                       preload_poi_visits_list_filename=None,
+                                       poi_cbg_visits_list=None,
+                                       poi_ids=poi_ids,
+                                       cbg_ids=cbg_ids,
+                                       correct_poi_visits=True,
+                                       multiply_poi_visit_counts_by_census_ratio=True,
+                                       aggregate_home_cbg_col='aggregated_cbg_population_adjusted_visitor_home_cbgs',
+                                       poi_hourly_visits_cutoff=POI_HOURLY_VISITS_CUTOFF,  
+                                       cbg_count_cutoff=CBG_COUNT_CUTOFF,
+                                       cbgs_to_filter_for=None,
+                                       cbg_groups_to_track=None,
+                                       counties_to_track=None,
+                                       include_cbg_prop_out=True,
+                                       include_inter_cbg_travel=False,
+                                       include_mask_use=False,
+                                       model_init_kwargs={'ipf_final_match':'poi',
+                                                          'ipf_num_iter':100,
+                                                          'num_seeds':2},
+                                       simulation_kwargs={'do_ipf':True, 
+                                                          'allow_early_stopping':False},
+                                       counterfactual_poi_opening_experiment_kwargs=None,
+                                       counterfactual_retrospective_experiment_kwargs=None,
+                                       return_model_without_fitting=True,  # note: changed from False to True
+                                       attach_data_to_model=True,
+                                       model_quality_dict=None,
+                                       verbose=True)
+    Z, u, v = _prep_safegraph_data_for_ipf(m.POI_TIME_COUNTS, m.cbg_day_prop_out, 
+                                          m.CBG_SIZES, m.POI_CBG_PROPORTIONS.toarray(), dt.hour)
+    return Z, u, v
+    
+    
+def _prep_safegraph_data_for_ipf(poi_time_counts, cbg_day_prop_out, cbg_sizes, 
+                                 poi_cbg_props, t):
+    """
+    Helper function to prep IPF inputs from preprocessed SafeGraph data.
     poi_time_counts: n_pois x hours, represents hourly number of visits to each POI
     cbg_day_prop_out: n_cbgs x days, represents daily proportion of each CBG that is out.
                       we use median when value is NaN.
@@ -400,70 +461,22 @@ def print_stats_of_aggregated_matrix(poi_ids, cbg_ids, poi_cbg_props):
     
 def run_ipf_experiment(msa_name, dt, msa_df_date_range, max_iter=1000):
     """
-    Do IPF on SafeGraph data for given datetime.
+    Run IPF on SafeGraph data for given datetime.
     msa_name: name of metropolitan statistical area
     dt: datetime object, with year, month, day, and hour
-    msa_df_date_range: the date range that includes datetime; we store MSA dataframes stratified by date ranges
+    msa_df_date_range: SafeGraph data is stored per date range; this is the date range corresponding to this datetime
+    max_iter: max iterations to run IPF
     """
-    min_datetime = datetime.datetime(dt.year, dt.month, dt.day, 0)
-    max_datetime = datetime.datetime(dt.year, dt.month, dt.day, 23)
-    CBG_COUNT_CUTOFF = 100  # this doesn't matter since CBGs are prespecified
-    POI_HOURLY_VISITS_CUTOFF = 'all'  # same, doesn't matter
-    poi_ids = helper.load_poi_ids_for_msa(msa_name)
-    cbg_ids = helper.load_cbg_ids_for_msa(msa_name)
-    print('Loaded %d POI and %d CBG ids' % (len(poi_ids), len(cbg_ids)))
-    msa_df = helper.prep_msa_df_for_model_experiments(msa_name, [msa_df_date_range])
-    m = fit_disease_model_on_real_data(d=msa_df,
-                                       min_datetime=min_datetime,
-                                       max_datetime=max_datetime,
-                                       msa_name=msa_name,
-                                       exogenous_model_kwargs={'poi_psi':1, 
-                                                               'home_beta':1, 
-                                                               'p_sick_at_t0':0,  # don't need infections
-                                                               'just_compute_r0':False},
-                                       poi_attributes_to_clip={'clip_areas':True, 
-                                                               'clip_dwell_times':True, 
-                                                               'clip_visits':True},
-                                       preload_poi_visits_list_filename=None,
-                                       poi_cbg_visits_list=None,
-                                       poi_ids=poi_ids,
-                                       cbg_ids=cbg_ids,
-                                       correct_poi_visits=True,
-                                       multiply_poi_visit_counts_by_census_ratio=True,
-                                       aggregate_home_cbg_col='aggregated_cbg_population_adjusted_visitor_home_cbgs',
-                                       poi_hourly_visits_cutoff=POI_HOURLY_VISITS_CUTOFF,  
-                                       cbg_count_cutoff=CBG_COUNT_CUTOFF,
-                                       cbgs_to_filter_for=None,
-                                       cbg_groups_to_track=None,
-                                       counties_to_track=None,
-                                       include_cbg_prop_out=True,
-                                       include_inter_cbg_travel=False,
-                                       include_mask_use=False,
-                                       model_init_kwargs={'ipf_final_match':'poi',
-                                                          'ipf_num_iter':100,
-                                                          'num_seeds':2},
-                                       simulation_kwargs={'do_ipf':True, 
-                                                          'allow_early_stopping':False},
-                                       counterfactual_poi_opening_experiment_kwargs=None,
-                                       counterfactual_retrospective_experiment_kwargs=None,
-                                       # important - changed this from False to True
-                                       return_model_without_fitting=True,
-                                       attach_data_to_model=True,
-                                       model_quality_dict=None,
-                                       verbose=True)
-    
-    Z, u, v = prep_safegraph_data_for_ipf(m.POI_TIME_COUNTS, m.cbg_day_prop_out, 
-                                          m.CBG_SIZES, m.POI_CBG_PROPORTIONS.toarray(), dt.hour)
+    Z, u, v = prep_safegraph_data_for_ipf(msa_name, dt, msa_df_date_range)
     print('Date: %s, marginals prop positive -> POIs = %.3f, CBGs = %.3f' % (
         dt.strftime('%Y-%m-%d-%H'), np.mean(u > 0), np.mean(v > 0)))
     ts = time.time()
     ipf_out = do_ipf(Z, u, v, num_iter=max_iter)
     print('Finished IPF: time=%.2fs' % (time.time()-ts))
-    fn = '%s_%s.pkl' % (msa_name, dt.strftime('%Y-%m-%d-%H'))
+    fn = 'ipf-output/%s_%s.pkl' % (msa_name, dt.strftime('%Y-%m-%d-%H'))
     print('Saving results in', fn)
     with open(fn, 'wb') as f:
         pickle.dump(ipf_out, f)
-        
         
 def run_all_hours_in_day(msa_name, dt):
     """
@@ -472,12 +485,150 @@ def run_all_hours_in_day(msa_name, dt):
     print('Running IPF for %s, all hours on %s...' % (msa_name, dt.strftime('%Y-%m-%d')))
     for hr in range(24):
         curr_dt = datetime.datetime(year=dt.year, month=dt.month, day=dt.day, hour=hr)
-        out_file = '%s_%s.out' % (msa_name, curr_dt.strftime('%Y-%m-%d-%H'))
+        out_file = 'ipf-output/%s_%s.out' % (msa_name, curr_dt.strftime('%Y-%m-%d-%H'))
         cmd = f'nohup python -u test_ipf.py {msa_name} --hour {hr} --mode inner > {out_file} 2>&1 &'
         print(cmd)
         os.system(cmd)
         time.sleep(1)
+
+        
+####################################################################
+# Compare IPF to Poisson regression
+####################################################################
+def run_poisson_experiment(X, p, q, Y=None, package='sm', method='IRLS'):
+    """
+    Do Poisson regression on IPF inputs.
+    X, p, q: IPF inputs.
+    Y: response variable. If Y is not provided, we use max-flow algorithm to find appropriate Y.
+    package: either 'sm' for statsmodels or 'sklearn' for scikit-learn.
+    method: method used for fitting model. Default is 'IRLS' (iteratively reweighted least squares), 
+        which is default for statsmodels. Another option is 'lbfgs' (default for sklearn).
+    """
+    assert (p > 0).all(), 'Row marginals must be positive for Poisson regression to converge'
+    assert (q > 0).all(), 'Col marginals must be positive for Poisson regression to converge'
+    assert package in ['sm', 'sklearn']
+    if package == 'sklearn':
+        raise Exception('Poisson regression not fully implemented for sklearn yet')
+    m, n = X.shape
     
+    # construct one-hot matrix representing row and col indices
+    row_nnz, col_nnz = X.nonzero()
+    nnz = len(row_nnz)
+    csr_rows = np.concatenate([np.arange(nnz, dtype=int), np.arange(nnz, dtype=int)])
+    csr_cols = np.concatenate([row_nnz, col_nnz+m]).astype(int)
+    csr_data = np.concatenate([np.ones(nnz), np.ones(nnz)])
+    onehots = csr_matrix((csr_data, (csr_rows, csr_cols)), shape=(nnz, m+n)).toarray()
+    assert (np.sum(onehots, axis=1) == 2).all()  # each row should have two nonzero entries
+    print('Constructed one-hot mat:', onehots.shape)
+
+    # construct response variable
+    if Y is None:  # get Y by running max-flow algorithm
+        G, f_val, f_dict = test_ipf_convergence_from_max_flow(X, p, q)
+        assert np.isclose(f_val, np.sum(p))  # IPF should converge
+        Y = np.zeros((m, n))
+        for i in np.arange(m):  # iterate through row nodes
+            cols, flows = zip(*list(f_dict[i].items()))  # get flows to col nodes
+            Y[i, np.array(cols, dtype=int)-m] = flows  # col nodes indexed by j+m in G
+    assert (Y[X == 0] == 0).all()  # Y should inherit all zeros of X
+    assert np.isclose(np.sum(Y, axis=1), p).all()  # Y should have target row marginals
+    assert np.isclose(np.sum(Y, axis=0), q).all()  # Y should have target col marginals
+    resp = Y[row_nnz, col_nnz]
+    print('Constructed response variable:', resp.shape)
+    
+    if package == 'sm':  # statsmodels
+        ts = time.time()
+        offset = np.log(X[row_nnz, col_nnz])  # include in linear model with coefficient of 1
+        mdl = sm.GLM(resp, onehots, offset=offset, family=sm.families.Poisson())
+        print('Initialized Poisson model [time=%.3fs]' % (time.time()-ts))
+        ts = time.time()
+        result = mdl.fit(method=method, maxiter=1000)
+        print('Finished fitting model with statsmodels, method %s [time=%.3fs]' % (method, time.time()-ts))
+    else:  # sklearn
+        ts = time.time()
+        # TODO: figure out how to include offset
+        mdl = PoissonRegressor(alpha=0, fit_intercept=False, solver=method)
+        mdl.fit(onehots, resp)
+        result = None
+        print('Finished fitting model with sklearn, method %s [time=%.3fs]' % (method, time.time()-ts))
+    return mdl, result
+
+def test_poisson_with_mobility_data(dt, method):
+    """
+    Function to test Poisson regression on mobility data. Note: this function takes hours to run,
+    since Poisson regression takes very long on large number of parameters.
+    """
+    msa_name = 'Richmond_VA'
+    msa_df_date_range = '20200302_20200608'
+    X, p, q = prep_safegraph_data_for_ipf(msa_name, dt, msa_df_date_range)
+    print('Date: %s, marginals prop positive -> POIs = %.3f, CBGs = %.3f' % (
+        dt.strftime('%Y-%m-%d-%H'), np.mean(p > 0), np.mean(q > 0)))
+    
+    # keep submatrix with nonzero row and column marginals
+    nonzero_rows = p > 0
+    X = X[nonzero_rows]
+    p = p[nonzero_rows]
+    nonzero_cols = q > 0
+    X = X[:, nonzero_cols]
+    q = q[nonzero_cols]
+    print('Shape without zero marginals:', X.shape, len(p), len(q))
+    
+    fn = f'poisson-{method}.pkl'
+    print('Will save results in', fn)
+    mdl, result = run_poisson_experiment(X, p, q, Y=None, method=method)
+    result.save(fn)
+    
+def visualize_ipf_vs_poisson_params(row_factors, col_factors, result, log_ipf=True, with_cis=True):
+    """
+    Plot IPF parameters vs Poisson regression parameters. If log_ipf is True, log transform IPF parameters.
+    If log_ipf is False, exponentiate the Poisson regression parameters.
+    """
+    coefs = result.params
+    cis = result.conf_int(alpha=0.05)
+    if log_ipf:
+        ipf_rows = np.log(row_factors)
+        ipf_cols = np.log(col_factors)
+        ipf_row_label = '\log(d^0_i)'
+        ipf_col_label = '\log(d^1_j)'
+        pois_rows = coefs[:len(row_factors)]
+        pois_rows_cis = cis[:len(row_factors)]
+        pois_cols = coefs[len(row_factors):]
+        pois_cols_cis = cis[len(row_factors):]
+        pois_row_label = '\\theta_i'
+        pois_col_label = '\\theta_j'
+    else:
+        ipf_rows = row_factors
+        ipf_cols = col_factors
+        ipf_row_label = 'd^0_i'
+        ipf_col_label = 'd^1_j'
+        pois_rows = np.exp(coefs[:len(row_factors)])
+        pois_rows_cis = np.exp(cis[:len(row_factors)])
+        pois_cols = np.exp(coefs[len(row_factors):])
+        pois_cols_cis = np.exp(cis[len(row_factors):])
+        pois_row_label = '\exp(\\theta_i)'
+        pois_col_label = '\exp(\\theta_j)'
+        
+    fig, axes = plt.subplots(1, 2, figsize=(11, 5))
+    fig.subplots_adjust(wspace=0.3)
+    ax = axes[0]
+    ax.scatter(ipf_rows, pois_rows)
+    if with_cis:
+        for i in range(len(ipf_rows)):
+            ax.plot([ipf_rows[i], ipf_rows[i]], [pois_rows_cis[i, 0], pois_rows_cis[i, 1]], 
+                    color='grey', alpha=0.5)
+    ax.set_xlabel(f'${ipf_row_label}$ from IPF', fontsize=12)
+    ax.set_ylabel(f'${pois_row_label}$ from Poisson regression', fontsize=12)
+    ax.grid(alpha=0.2)
+    ax = axes[1]
+    ax.scatter(ipf_cols, pois_cols)
+    if with_cis:
+        for j in range(len(ipf_cols)):
+            ax.plot([ipf_cols[j], ipf_cols[j]], [pois_cols_cis[j, 0], pois_cols_cis[j, 1]],
+                    color='grey', alpha=0.5)
+    ax.set_xlabel(f'${ipf_col_label}$ from IPF', fontsize=12)
+    ax.set_ylabel(f'${pois_col_label}$ from Poisson regression', fontsize=12)
+    ax.grid(alpha=0.2)
+    plt.show()
+
     
 if __name__ == '__main__':
     # test_recoverable_process(sparsity_rate=0.8, seed=1)
@@ -488,9 +639,11 @@ if __name__ == '__main__':
     parser.add_argument('--mode', default='outer', choices=['outer', 'inner'])
     args = parser.parse_args()
     
-    dt = datetime.datetime(2020, 3, 1, args.hour)  # use March 1, 2020 for now
+    # dt = datetime.datetime(2020, 3, 2, args.hour)
+    dt = datetime.datetime(2020, 4, 6, args.hour)  # same two days as in original paper
     if args.mode == 'outer':
         run_all_hours_in_day(args.msa_name, dt)
     else:
-        msa_df_date_range = '20191230_20200224'
+        # msa_df_date_range = '20191230_20200224'
+        msa_df_date_range = '20200302_20200608'
         run_ipf_experiment(args.msa_name, dt, msa_df_date_range, max_iter=args.max_iter)
