@@ -85,10 +85,10 @@ def do_ipf(Z, u, v, num_iter=100, start_iter=0, row_factors=None, col_factors=No
         # check if converged
         if len(all_est_M) >= 2:
             delta = np.sum(np.abs(all_est_M[-1] - all_est_M[-2]))
-            if delta < esp:  # converged
+            if delta < eps:  # converged
                 if verbose:
                     print(f'Converged; stopping after {i} iterations')
-            break
+                break
             
         # check if stuck in oscillation
         if len(all_est_M) >= 4:
@@ -212,14 +212,44 @@ def test_ipf_convergence_from_max_flow(A, p, q):
         f_val, np.sum(p), np.isclose(f_val, np.sum(p))))
     return G, f_val, f_dict
 
-def test_ipf_convergence_from_row_subsets(A, p, q):
+def test_ipf_convergence_from_cbg_subsets(A, p, q, max_set_size=5):
     """
-    Test whether IPF will converge by testing row subsets and their corresponding
-    columns. This is not an efficient way to test for convergence, but explains more
-    directly which constraint is getting violated 
+    Test whether IPF will converge by testing CBG subsets and their corresponding
+    POIs. This is not an efficient way to test for convergence, but explains more
+    directly which constraint is getting violated.
     """
-    pass
-
+    # for each subset of CBGs, its total marginals must be less than or equal
+    # to the total marginals of its corresponding POIs
+    cbgs = np.arange(len(q), dtype=int)
+    corresponding_pois = csr_matrix((A > 0).astype(int).T)  # maps CBGs to corresponding POIs
+    for set_size in range(1, max_set_size+1):
+        ts = time.time()
+        sets = np.array(list(itertools.combinations(cbgs, set_size)))
+        print(f'Found {len(sets)} sets of size {set_size}')
+        set_inds = np.zeros((len(sets), len(q)), dtype=int)  # num_sets x num_cbgs
+        for i in range(set_size):
+            # indicators of which CBGs are in each set
+            set_inds[np.arange(len(sets)), sets[:, i]] = 1
+        set_inds = csr_matrix(set_inds)
+            
+        # get total CBG marginals per set
+        set_cbg_marginals = (set_inds @ q.reshape(-1, 1)).reshape(-1)
+        # get total POI marginals per set
+        set_pois = set_inds @ corresponding_pois  # which POIs correspond to CBGs in set, num_sets x num_pois
+        set_pois = set_pois.minimum(1)  # element-wise minimum, used to binarize
+        set_poi_marginals = (set_pois @ p.reshape(-1, 1)).reshape(-1)
+        
+        passed = set_cbg_marginals <= set_poi_marginals
+        print('Finished checks for this set size [time = %.3fs]' % (time.time()-ts))
+        if not passed.all():
+            print('Found %d violations' % (~passed).sum())
+            violated_set_idx = np.arange(len(sets))[~passed]
+            for si in violated_set_idx:
+                cbgs = sets[si]
+                print('CBGs: %s -> CBG total = %.4f, POI total = %.4f' % (cbgs, set_cbg_marginals[si], set_poi_marginals[si]))
+            return sets, set_cbg_marginals, set_poi_marginals
+        print('Passed all subsets!\n')
+        
 
 ####################################################################
 # Experiments with synthetic matrices
@@ -632,25 +662,25 @@ def visualize_ipf_vs_poisson_params(ipf_row_factors, ipf_col_factors, reg_coefs,
     if log_ipf:
         ipf_row_factors = np.log(ipf_row_factors)
         ipf_col_factors = np.log(ipf_col_factors)
-        ipf_row_label = '\log(d^0_i)'
-        ipf_col_label = '\log(d^1_j)'
+        ipf_row_label = '$\log(d^0_i)$'
+        ipf_col_label = '$\log(d^1_j)$'
         reg_row_coefs = np.log(reg_row_coefs)
         reg_row_cis = np.log(reg_row_cis) if reg_row_cis is not None else None
         reg_col_coefs = np.log(reg_col_coefs)
         reg_col_cis = np.log(reg_col_cis) if reg_col_cis is not None else None
-        reg_row_label = '\\theta_i'
-        reg_col_label = '\\theta_j'
+        reg_row_label = '$\\theta_i$'
+        reg_col_label = '$\\theta_j$'
         true_row_factors = np.log(true_row_factors) if true_row_factors is not None else None
         true_col_factors = np.log(true_col_factors) if true_col_factors is not None else None    
-        true_row_label = 'u_i'
-        true_col_label = '-v_j'
+        true_row_label = '$u_i$'
+        true_col_label = '$-v_j$'
     else:
-        ipf_row_label = 'd^0_i'
-        ipf_col_label = 'd^1_j'
-        reg_row_label = '\exp(\\theta_i)'
-        reg_col_label = '\exp(\\theta_j)'
-        true_row_label = '\exp(u_i)'
-        true_col_label = '\exp(-v_j)'
+        ipf_row_label = '$d^0_i$'
+        ipf_col_label = '$d^1_j$'
+        reg_row_label = '$\exp(\\theta_i)$'
+        reg_col_label = '$\exp(\\theta_j)$'
+        true_row_label = '$\exp(u_i)$'
+        true_col_label = '$\exp(-v_j)$'
         
     fig, axes = plt.subplots(1, 2, figsize=(11, 5), sharex=True, sharey=True)
     fig.subplots_adjust(wspace=0.3)
@@ -661,9 +691,9 @@ def visualize_ipf_vs_poisson_params(ipf_row_factors, ipf_col_factors, reg_coefs,
         for i in range(m):
             ax.plot([ipf_row_factors[i], ipf_row_factors[i]], [reg_row_cis[i, 0], reg_row_cis[i, 1]], 
                     color='grey', alpha=0.5)
-    ax.set_xlabel(f'${ipf_row_label}$ from IPF', fontsize=14)
+    ax.set_xlabel(f'{ipf_row_label} from IPF', fontsize=14)
     color = 'black' if true_row_factors is None else 'tab:blue'
-    ax.set_ylabel(f'${reg_row_label}$ from Poisson regression', color=color, fontsize=14)
+    ax.set_ylabel(f'{reg_row_label} from Poisson regression', color=color, fontsize=14)
     ax.grid(alpha=0.2)
     if normalize:
         ax.plot(ipf_row_factors, ipf_row_factors, label='y=x')
@@ -681,9 +711,9 @@ def visualize_ipf_vs_poisson_params(ipf_row_factors, ipf_col_factors, reg_coefs,
         for j in range(n):
             ax.plot([ipf_col_factors[j], ipf_col_factors[j]], [reg_col_cis[j, 0], reg_col_cis[j, 1]],
                     color='grey', alpha=0.5)
-    ax.set_xlabel(f'${ipf_col_label}$ from IPF', fontsize=14)
+    ax.set_xlabel(f'{ipf_col_label} from IPF', fontsize=14)
     color = 'black' if true_col_factors is None else 'tab:blue'
-    ax.set_ylabel(f'${reg_col_label}$ from Poisson regression', color=color, fontsize=14)
+    ax.set_ylabel(f'{reg_col_label} from Poisson regression', color=color, fontsize=14)
     ax.grid(alpha=0.2)
     if normalize:
         ax.plot(ipf_col_factors, ipf_col_factors, label='y=x')
@@ -698,14 +728,14 @@ def visualize_ipf_vs_poisson_params(ipf_row_factors, ipf_col_factors, reg_coefs,
     if true_row_factors is not None:
         ax_twin = axes[0].twinx()
         ax_twin.scatter(ipf_row_factors, true_row_factors, color='tab:orange', alpha=0.5)
-        ax_twin.set_ylabel(f'${true_row_label}$ from Poisson model', color='tab:orange', fontsize=14)
+        ax_twin.set_ylabel(f'{true_row_label} from Poisson model', color='tab:orange', fontsize=14)
         ax_twin.set_xlim(axes[0].get_xlim())
         ax_twin.set_ylim(axes[0].get_ylim())
         ax_twin.tick_params(labelsize=12)
     if true_col_factors is not None:
         ax_twin = axes[1].twinx()
         ax_twin.scatter(ipf_col_factors, true_col_factors, color='tab:orange', alpha=0.5)
-        ax_twin.set_ylabel(f'${true_col_label}$ from Poisson model', color='tab:orange', fontsize=14)
+        ax_twin.set_ylabel(f'{true_col_label} from Poisson model', color='tab:orange', fontsize=14)
         ax_twin.set_xlim(axes[1].get_xlim())
         ax_twin.set_ylim(axes[1].get_ylim())
         ax_twin.tick_params(labelsize=12)
