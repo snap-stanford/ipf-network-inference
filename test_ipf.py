@@ -3,12 +3,14 @@ from model_experiments import fit_disease_model_on_real_data
 
 import argparse
 import datetime
+import itertools
 import matplotlib.pyplot as plt
 import networkx as nx
 from networkx.algorithms import bipartite
 import numpy as np
 import os
 import pickle
+import random
 from scipy.sparse import csr_matrix
 from sklearn.linear_model import PoissonRegressor
 import statsmodels.api as sm
@@ -17,12 +19,21 @@ import time
 ####################################################################
 # Functions to do IPF / test IPF convergence
 ####################################################################
-def do_ipf(Z, u, v, start_iter=0, num_iter=100, row_factors=None, col_factors=None, 
-           eps=1e-8, verbose=True,):
+def do_ipf(Z, u, v, num_iter=100, start_iter=0, row_factors=None, col_factors=None, 
+           eps=1e-8, return_all_factors=False, verbose=True):
     """
     Z: initial matrix
     u: target row marginals
     v: target col marginals
+    num_iter: number of iterations to run
+    start_iter: which iteration to start at
+                If start_iter > 0, then initial row_factors and col_factors must be provided
+                Otherwise, we initialize to all ones
+    row_factors: initial row factors
+    col_factors: initial col factors
+    eps: epsilon to check for convergence
+    return_all_factors: whether to return row and column factors over all iterations or just 
+                the final factors
     """
     assert Z.shape == (len(u), len(v))
     if not np.isclose(np.sum(u), np.sum(v)):
@@ -39,10 +50,12 @@ def do_ipf(Z, u, v, start_iter=0, num_iter=100, row_factors=None, col_factors=No
         assert row_factors is None and col_factors is None
         row_factors = np.ones(Z.shape[0])
         col_factors = np.ones(Z.shape[1])
-        
+    
+    all_row_factors = []
+    all_col_factors = []
+    all_est_M = []
     row_errs = []
     col_errs = []
-    prev_M = None
     for i in range(start_iter, start_iter+num_iter):
         if (i%2) == 0:  # adjust row factors
             row_sums = np.sum(Z @ np.diag(col_factors), axis=1)
@@ -56,9 +69,12 @@ def do_ipf(Z, u, v, start_iter=0, num_iter=100, row_factors=None, col_factors=No
             col_factors = v / np.clip(col_sums, 1e-8, None)
             # if marginals are 0, column factor should be 0
             col_factors[np.isclose(v, 0)] = 0
+        all_row_factors.append(row_factors)
+        all_col_factors.append(col_factors)
      
         # get error from marginals
         est_M = np.diag(row_factors) @ Z @ np.diag(col_factors)
+        all_est_M.append(est_M)
         row_err = np.sum(np.abs(u - np.sum(est_M, axis=1)))
         col_err = np.sum(np.abs(v - np.sum(est_M, axis=0)))
         row_errs.append(row_err)
@@ -67,19 +83,22 @@ def do_ipf(Z, u, v, start_iter=0, num_iter=100, row_factors=None, col_factors=No
             print('Iter %d: row err = %.4f, col err = %.4f' % (i, row_err, col_err))
         
         # check if converged
-        if prev_M is not None and (np.sum(np.abs(est_M - prev_M)) < eps):
-            if verbose:
-                print(f'Converged; stopping after {i} iterations')
-            return i, row_factors, col_factors, row_errs, col_errs
+        if len(all_est_M) >= 2:
+            delta = np.sum(np.abs(all_est_M[-1] - all_est_M[-2]))
+            if delta < esp:  # converged
+                if verbose:
+                    print(f'Converged; stopping after {i} iterations')
+            break
+            
         # check if stuck in oscillation
-        if len(row_errs) >= 6:
-            row_alternating = np.tile([row_errs[-2], row_errs[-1]], 3)  # create repeating pair 
-            col_alternating = np.tile([col_errs[-2], col_errs[-1]], 3)  # create repeating pair
-            if np.isclose(row_errs[-6:], row_alternating).all() and np.isclose(col_errs[-6:], col_alternating).all():
+        if len(all_est_M) >= 4:
+            if np.isclose(all_est_M[-1], all_est_M[-3]).all() and np.isclose(all_est_M[-2], all_est_M[-4]).all():
                 if verbose:
                     print(f'Stuck in oscillation; stopping after {i} iterations')
-                return i, row_factors, col_factors, row_errs, col_errs
-        prev_M = est_M
+                break                                
+        
+    if return_all_factors:  # return factors per iteration
+        return i, np.array(all_row_factors), np.array(all_col_factors), row_errs, col_errs
     return i, row_factors, col_factors, row_errs, col_errs
 
 
@@ -205,7 +224,7 @@ def test_ipf_convergence_from_row_subsets(A, p, q):
 ####################################################################
 # Experiments with synthetic matrices
 ####################################################################
-def generate_M(dist='uniform', m=100, n=200, seed=0, sparsity_rate=0, verbose=True):
+def generate_M(dist='uniform', m=100, n=200, seed=0, sparsity_rate=0, exact_rate=False, verbose=True):
     """
     Generate M based on kwargs.
     sparsity_rate: each entry is set to 0 with probability sparsity_rate.
@@ -220,7 +239,15 @@ def generate_M(dist='uniform', m=100, n=200, seed=0, sparsity_rate=0, verbose=Tr
         M = np.random.poisson(lam=10, size=(m,n))
     if sparsity_rate > 0:
         assert sparsity_rate < 1
-        set_to_0 = np.random.rand(m, n) < sparsity_rate
+        if exact_rate:
+            random.seed(seed)
+            num_zeros = int(sparsity_rate * (m*n))  # sample exactly this number of entries to set to 0
+            pairs = list(itertools.product(range(m), range(n)))  # all possible pairs
+            set_to_0 = random.sample(pairs, num_zeros)  # sample without replacement
+            set_to_0 = ([t[0] for t in set_to_0], [t[1] for t in set_to_0])
+        else:
+            # set each entry to 0 with independent probability sparsity_rate
+            set_to_0 = np.random.rand(m, n) < sparsity_rate
         M[set_to_0] = 0
         if verbose:
             print('Num nonzero entries in M: %d out of %d' % (np.sum(M > 0), m*n))
@@ -577,8 +604,7 @@ def test_poisson_with_mobility_data(dt, method):
     mdl, result = run_poisson_experiment(X, p, q, Y=None, method=method)
     print(result.summary())
     with open(fn, 'wb') as f:
-        pickle.dump((result.params, result.conf_int(alpha=0.05), result.conf_int(alpha=0.1)))
-    result.save(fn)
+        pickle.dump((result.params, result.conf_int(alpha=0.05), result.conf_int(alpha=0.1)), f)
     
 def visualize_ipf_vs_poisson_params(ipf_row_factors, ipf_col_factors, reg_coefs, reg_cis=None,
                                     true_row_factors=None, true_col_factors=None, normalize=True,
@@ -635,16 +661,18 @@ def visualize_ipf_vs_poisson_params(ipf_row_factors, ipf_col_factors, reg_coefs,
         for i in range(m):
             ax.plot([ipf_row_factors[i], ipf_row_factors[i]], [reg_row_cis[i, 0], reg_row_cis[i, 1]], 
                     color='grey', alpha=0.5)
-    ax.set_xlabel(f'${ipf_row_label}$ from IPF', fontsize=12)
-    ax.set_ylabel(f'${reg_row_label}$ from Poisson regression', color='tab:blue', fontsize=12)
+    ax.set_xlabel(f'${ipf_row_label}$ from IPF', fontsize=14)
+    color = 'black' if true_row_factors is None else 'tab:blue'
+    ax.set_ylabel(f'${reg_row_label}$ from Poisson regression', color=color, fontsize=14)
     ax.grid(alpha=0.2)
     if normalize:
         ax.plot(ipf_row_factors, ipf_row_factors, label='y=x')
-        ax.legend(loc='lower right')
+        ax.legend(loc='lower right', fontsize=14)
     if xlim is not None:
         ax.set_xlim(xlim)
     if ylim is not None:
         ax.set_ylim(ylim)
+    ax.tick_params(labelsize=12)
     
     # plot column params
     ax = axes[1]
@@ -653,30 +681,34 @@ def visualize_ipf_vs_poisson_params(ipf_row_factors, ipf_col_factors, reg_coefs,
         for j in range(n):
             ax.plot([ipf_col_factors[j], ipf_col_factors[j]], [reg_col_cis[j, 0], reg_col_cis[j, 1]],
                     color='grey', alpha=0.5)
-    ax.set_xlabel(f'${ipf_col_label}$ from IPF', fontsize=12)
-    ax.set_ylabel(f'${reg_col_label}$ from Poisson regression', color='tab:blue', fontsize=12)
+    ax.set_xlabel(f'${ipf_col_label}$ from IPF', fontsize=14)
+    color = 'black' if true_col_factors is None else 'tab:blue'
+    ax.set_ylabel(f'${reg_col_label}$ from Poisson regression', color=color, fontsize=14)
     ax.grid(alpha=0.2)
     if normalize:
         ax.plot(ipf_col_factors, ipf_col_factors, label='y=x')
-        ax.legend(loc='lower right')
+        ax.legend(loc='lower right', fontsize=14)
     if xlim is not None:
         ax.set_xlim(xlim)
     if ylim is not None:
         ax.set_ylim(ylim)
+    ax.tick_params(labelsize=12)
     
     # add true scaling factors in orange
     if true_row_factors is not None:
         ax_twin = axes[0].twinx()
         ax_twin.scatter(ipf_row_factors, true_row_factors, color='tab:orange', alpha=0.5)
-        ax_twin.set_ylabel(f'${true_row_label}$ from Poisson model', color='tab:orange', fontsize=12)
+        ax_twin.set_ylabel(f'${true_row_label}$ from Poisson model', color='tab:orange', fontsize=14)
         ax_twin.set_xlim(axes[0].get_xlim())
         ax_twin.set_ylim(axes[0].get_ylim())
+        ax_twin.tick_params(labelsize=12)
     if true_col_factors is not None:
         ax_twin = axes[1].twinx()
         ax_twin.scatter(ipf_col_factors, true_col_factors, color='tab:orange', alpha=0.5)
-        ax_twin.set_ylabel(f'${true_col_label}$ from Poisson model', color='tab:orange', fontsize=12)
+        ax_twin.set_ylabel(f'${true_col_label}$ from Poisson model', color='tab:orange', fontsize=14)
         ax_twin.set_xlim(axes[1].get_xlim())
         ax_twin.set_ylim(axes[1].get_ylim())
+        ax_twin.tick_params(labelsize=12)
     return fig, axes
 
     
@@ -699,5 +731,5 @@ if __name__ == '__main__':
 #         run_ipf_experiment(args.msa_name, dt, msa_df_date_range, max_iter=args.max_iter)
     
     dt = datetime.datetime(2020, 3, 2, 12)
-    method = 'lbfgs'
+    method = 'irls'
     test_poisson_with_mobility_data(dt, method)
