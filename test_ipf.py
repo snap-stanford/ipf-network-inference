@@ -92,7 +92,10 @@ def do_ipf(Z, u, v, num_iter=100, start_iter=0, row_factors=None, col_factors=No
             
         # check if stuck in oscillation
         if len(all_est_M) >= 4:
-            if np.isclose(all_est_M[-1], all_est_M[-3]).all() and np.isclose(all_est_M[-2], all_est_M[-4]).all():
+            same1 = np.isclose(all_est_M[-1], all_est_M[-3]).all()
+            same2 = np.isclose(all_est_M[-2], all_est_M[-4]).all()
+            diff_consecutive = ~(np.isclose(all_est_M[-1], all_est_M[-2]).all())
+            if same1 and same2 and diff_consecutive:
                 if verbose:
                     print(f'Stuck in oscillation; stopping after {i} iterations')
                 break                                
@@ -102,9 +105,138 @@ def do_ipf(Z, u, v, num_iter=100, start_iter=0, row_factors=None, col_factors=No
     return i, row_factors, col_factors, row_errs, col_errs
 
 
+def test_ipf_convergence_from_max_flow(A, p, q, return_flow_mat=False):
+    """
+    Test whether IPF will converge via max flow algorithm.
+    From networkx documentation: "Edges of the graph are expected to have 
+    an attribute called ‘capacity’. If this attribute is not present, the edge 
+    is considered to have infinite capacity."
+    """
+    assert np.isclose(np.sum(p), np.sum(q))
+    G = nx.DiGraph()
+    # add edges from source to row nodes with capacity p
+    G.add_node('source')
+    row_nodes = np.arange(len(p))
+    G.add_nodes_from(row_nodes)
+    edges = list(zip(['source'] * len(p), row_nodes))
+    G.add_edges_from(edges)
+    capacities = dict(zip(edges, p))
+    nx.set_edge_attributes(G, name='capacity', values=capacities)
+    
+    # add edges from column nodes to sink with capacity q
+    G.add_node('sink')
+    col_nodes = np.arange(len(q)) + len(p)
+    G.add_nodes_from(col_nodes)
+    edges = list(zip(col_nodes, ['sink'] * len(q)))
+    G.add_edges_from(edges)
+    capacities = dict(zip(edges, q))
+    nx.set_edge_attributes(G, name='capacity', values=capacities)
+    
+    # add edges between row and column nodes with infinite capacity
+    nnz_row, nnz_col = np.nonzero(A)
+    edges = zip(row_nodes[nnz_row], col_nodes[nnz_col])
+    G.add_edges_from(edges)
+    print('Constructed graph for max flow')
+    
+    # do maximum flow
+    ts = time.time()
+    f_val, f_dict = nx.maximum_flow(G, 'source', 'sink')
+    print('Finished computing max flow [time=%.2fs]' % (time.time()-ts))
+    print('Flow value = %.3f, marginal total = %.3f -> equal = %s' % (
+        f_val, np.sum(p), np.isclose(f_val, np.sum(p))))
+    
+    if return_flow_mat:  # return a matrix representing row->column flows
+        F = np.zeros(A.shape)
+        m = len(p)
+        for i in np.arange(m):  # iterate through row nodes
+            cols, flows = zip(*list(f_dict[i].items()))  # get flows to col nodes
+            F[i, np.array(cols, dtype=int)-m] = flows  # col nodes indexed by j+m in G
+        return G, f_val, F
+    # return the original flow dictionary
+    return G, f_val, f_dict
+
+
+def test_ipf_convergence_from_row_subsets(A, p, q, max_set_size=5, return_early=True):
+    """
+    Test whether IPF will converge by testing row subsets and their corresponding
+    columns. This is not an efficient way to test for convergence, but explains more
+    directly which constraint is getting violated.
+    """
+    # for each subset of rows, its total marginals must be less than or equal
+    # to the total marginals of its corresponding POIs
+    rows = np.arange(len(p), dtype=int)
+    corresponding_cols = csr_matrix((A > 0).astype(int))  # maps rows to cols
+    all_pass = True
+    for set_size in range(1, min(len(rows), max_set_size)+1):
+        ts = time.time()
+        sets = np.array(list(itertools.combinations(rows, set_size)))
+        print(f'Found {len(sets)} sets of size {set_size}')
+        set_inds = np.zeros((len(sets), len(rows)), dtype=int)  # num_sets x num_rows
+        for i in range(set_size):
+            # indicators of which rows are in each set
+            set_inds[np.arange(len(sets)), sets[:, i]] = 1
+        set_inds = csr_matrix(set_inds)
+            
+        # get total row marginals per set
+        set_row_marginals = (set_inds @ p.reshape(-1, 1)).reshape(-1)
+        # get total col marginals per set
+        set_cols = set_inds @ corresponding_cols  # which cols correspond to rows in set
+        set_cols = set_cols.minimum(1)  # element-wise minimum, used to binarize
+        set_col_marginals = (set_cols @ q.reshape(-1, 1)).reshape(-1)
+        
+        passed = set_row_marginals <= set_col_marginals
+        print('Finished checks for this set size [time = %.3fs]' % (time.time()-ts))
+        if not passed.all():
+            all_pass = False
+            print('Found %d violations' % (~passed).sum())
+            violated_set_idx = np.arange(len(sets))[~passed]
+            for si in violated_set_idx:
+                print('Rows: %s -> row total = %.4f, col total = %.4f' % (
+                    sets[si], set_row_marginals[si], set_col_marginals[si]))
+            if return_early:
+                return sets, set_row_marginals, set_col_marginals
+        print()
+    if all_pass:
+        print('Passed all subsets!\n')
+        
+        
+def find_blocking_row_subset(A, p, q, F=None):
+    """
+    Use max flow values to identify a blocking row subset.
+    """
+    if F is None:
+        _, _, F = test_ipf_convergence_from_max_flow(A, p, q, return_flow_mat=True)
+    assert np.sum(F) < np.sum(p)
+    rows = np.arange(len(p))
+    cols = np.arange(len(q))
+    row_flows = np.sum(F, axis=1)
+    below_cap = row_flows < p
+    assert below_cap.sum() > 0  # there must be at least one row under capacity
+    first_row = rows[below_cap][0]
+    
+    # run variant of BFS from this row
+    curr_nodes = [first_row]
+    layer = 0
+    seen_rows = set()
+    seen_cols = set()
+    while len(curr_nodes) > 0:
+        if (layer % 2) == 0:  # even layer, rows
+            seen_rows = seen_rows.union(set(curr_nodes))
+            col_sum = np.sum(A[curr_nodes], axis=0)  # sum over rows of columns
+            col_neighbors = cols[col_sum > 0]
+            curr_nodes = col_neighbors[~np.isin(col_neighbors, list(seen_cols))]
+        else:  # odd layer, columns
+            seen_cols = seen_cols.union(set(curr_nodes))
+            row_sum = np.sum(F[:, curr_nodes], axis=1)  # sum over columns of rows with flows
+            row_neighbors = rows[row_sum > 0]
+            curr_nodes = row_neighbors[~np.isin(row_neighbors, list(seen_rows))]
+        layer += 1
+    return seen_rows, seen_cols
+
+
 def test_ipf_convergence_from_choice_sets(A, p, q, sort_items=False, apportion_strategy='greedy'):
     """
-    Test whether IPF will converge via choice set construction algorithm.
+    DEPRECATED. Test whether IPF will converge via choice set construction algorithm.
     """
     assert (A >= 0).all() and (p >= 0).all() and (q >= 0).all()
     assert A.shape == (len(p), len(q))
@@ -171,85 +303,6 @@ def test_ipf_convergence_from_choice_sets(A, p, q, sort_items=False, apportion_s
     print('Comparison graph is strongly connected:', strongly_conected)
     return G
 
-def test_ipf_convergence_from_max_flow(A, p, q):
-    """
-    Test whether IPF will converge via max flow algorithm.
-    From networkx documentation: "Edges of the graph are expected to have 
-    an attribute called ‘capacity’. If this attribute is not present, the edge 
-    is considered to have infinite capacity."
-    """
-    assert np.isclose(np.sum(p), np.sum(q))
-    G = nx.DiGraph()
-    # add edges from source to row nodes with capacity p
-    G.add_node('source')
-    row_nodes = np.arange(len(p))
-    G.add_nodes_from(row_nodes)
-    edges = list(zip(['source'] * len(p), row_nodes))
-    G.add_edges_from(edges)
-    capacities = dict(zip(edges, p))
-    nx.set_edge_attributes(G, name='capacity', values=capacities)
-    
-    # add edges from column nodes to sink with capacity q
-    G.add_node('sink')
-    col_nodes = np.arange(len(q)) + len(p)
-    G.add_nodes_from(col_nodes)
-    edges = list(zip(col_nodes, ['sink'] * len(q)))
-    G.add_edges_from(edges)
-    capacities = dict(zip(edges, q))
-    nx.set_edge_attributes(G, name='capacity', values=capacities)
-    
-    # add edges between row and column nodes with infinite capacity
-    nnz_row, nnz_col = np.nonzero(A)
-    edges = zip(row_nodes[nnz_row], col_nodes[nnz_col])
-    G.add_edges_from(edges)
-    print('Constructed graph for max flow')
-    
-    # do maximum flow
-    ts = time.time()
-    f_val, f_dict = nx.maximum_flow(G, 'source', 'sink')
-    print('Finished computing max flow [time=%.2fs]' % (time.time()-ts))
-    print('Flow value = %.3f, marginal total = %.3f -> equal = %s' % (
-        f_val, np.sum(p), np.isclose(f_val, np.sum(p))))
-    return G, f_val, f_dict
-
-def test_ipf_convergence_from_cbg_subsets(A, p, q, max_set_size=5):
-    """
-    Test whether IPF will converge by testing CBG subsets and their corresponding
-    POIs. This is not an efficient way to test for convergence, but explains more
-    directly which constraint is getting violated.
-    """
-    # for each subset of CBGs, its total marginals must be less than or equal
-    # to the total marginals of its corresponding POIs
-    cbgs = np.arange(len(q), dtype=int)
-    corresponding_pois = csr_matrix((A > 0).astype(int).T)  # maps CBGs to corresponding POIs
-    for set_size in range(1, max_set_size+1):
-        ts = time.time()
-        sets = np.array(list(itertools.combinations(cbgs, set_size)))
-        print(f'Found {len(sets)} sets of size {set_size}')
-        set_inds = np.zeros((len(sets), len(q)), dtype=int)  # num_sets x num_cbgs
-        for i in range(set_size):
-            # indicators of which CBGs are in each set
-            set_inds[np.arange(len(sets)), sets[:, i]] = 1
-        set_inds = csr_matrix(set_inds)
-            
-        # get total CBG marginals per set
-        set_cbg_marginals = (set_inds @ q.reshape(-1, 1)).reshape(-1)
-        # get total POI marginals per set
-        set_pois = set_inds @ corresponding_pois  # which POIs correspond to CBGs in set, num_sets x num_pois
-        set_pois = set_pois.minimum(1)  # element-wise minimum, used to binarize
-        set_poi_marginals = (set_pois @ p.reshape(-1, 1)).reshape(-1)
-        
-        passed = set_cbg_marginals <= set_poi_marginals
-        print('Finished checks for this set size [time = %.3fs]' % (time.time()-ts))
-        if not passed.all():
-            print('Found %d violations' % (~passed).sum())
-            violated_set_idx = np.arange(len(sets))[~passed]
-            for si in violated_set_idx:
-                cbgs = sets[si]
-                print('CBGs: %s -> CBG total = %.4f, POI total = %.4f' % (cbgs, set_cbg_marginals[si], set_poi_marginals[si]))
-            return sets, set_cbg_marginals, set_poi_marginals
-        print('Passed all subsets!\n')
-        
 
 ####################################################################
 # Experiments with synthetic matrices
@@ -580,12 +633,8 @@ def run_poisson_experiment(X, p, q, Y=None, package='sm', method='IRLS'):
 
     # construct response variable
     if Y is None:  # get Y by running max-flow algorithm
-        G, f_val, f_dict = test_ipf_convergence_from_max_flow(X, p, q)
+        G, f_val, Y = test_ipf_convergence_from_max_flow(X, p, q, return_flow_mat=True)
         assert np.isclose(f_val, np.sum(p))  # IPF should converge
-        Y = np.zeros((m, n))
-        for i in np.arange(m):  # iterate through row nodes
-            cols, flows = zip(*list(f_dict[i].items()))  # get flows to col nodes
-            Y[i, np.array(cols, dtype=int)-m] = flows  # col nodes indexed by j+m in G
     assert (Y[X == 0] == 0).all()  # Y should inherit all zeros of X
     assert np.isclose(np.sum(Y, axis=1), p).all()  # Y should have target row marginals
     assert np.isclose(np.sum(Y, axis=0), q).all()  # Y should have target col marginals
