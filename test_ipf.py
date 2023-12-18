@@ -7,11 +7,16 @@ import itertools
 import matplotlib.pyplot as plt
 import networkx as nx
 from networkx.algorithms import bipartite
+from networkx.algorithms.flow import preflow_push
 import numpy as np
 import os
+from pulp import *
 import pickle
 import random
 from scipy.sparse import csr_matrix
+from scipy.linalg import eig
+from scipy import optimize
+from scipy.stats import pearsonr
 from sklearn.linear_model import PoissonRegressor
 import statsmodels.api as sm
 import time
@@ -19,7 +24,7 @@ import time
 ####################################################################
 # Functions to do IPF / test IPF convergence
 ####################################################################
-def do_ipf(Z, u, v, num_iter=100, start_iter=0, row_factors=None, col_factors=None, 
+def do_ipf(Z, u, v, num_iter=1000, start_iter=0, row_factors=None, col_factors=None, 
            eps=1e-8, return_all_factors=False, verbose=True):
     """
     Z: initial matrix
@@ -50,6 +55,7 @@ def do_ipf(Z, u, v, num_iter=100, start_iter=0, row_factors=None, col_factors=No
         assert row_factors is None and col_factors is None
         row_factors = np.ones(Z.shape[0])
         col_factors = np.ones(Z.shape[1])
+    print(f'Running IPF for max {num_iter} iterations')
     
     all_row_factors = []
     all_col_factors = []
@@ -86,8 +92,7 @@ def do_ipf(Z, u, v, num_iter=100, start_iter=0, row_factors=None, col_factors=No
         if len(all_est_M) >= 2:
             delta = np.sum(np.abs(all_est_M[-1] - all_est_M[-2]))
             if delta < eps:  # converged
-                if verbose:
-                    print(f'Converged; stopping after {i} iterations')
+                print(f'Converged; stopping after {i} iterations')
                 break
             
         # check if stuck in oscillation
@@ -96,8 +101,7 @@ def do_ipf(Z, u, v, num_iter=100, start_iter=0, row_factors=None, col_factors=No
             same2 = np.isclose(all_est_M[-2], all_est_M[-4]).all()
             diff_consecutive = ~(np.isclose(all_est_M[-1], all_est_M[-2]).all())
             if same1 and same2 and diff_consecutive:
-                if verbose:
-                    print(f'Stuck in oscillation; stopping after {i} iterations')
+                print(f'Stuck in oscillation; stopping after {i} iterations')
                 break                                
         
     if return_all_factors:  # return factors per iteration
@@ -105,7 +109,7 @@ def do_ipf(Z, u, v, num_iter=100, start_iter=0, row_factors=None, col_factors=No
     return i, row_factors, col_factors, row_errs, col_errs
 
 
-def test_ipf_convergence_from_max_flow(A, p, q, return_flow_mat=False):
+def test_ipf_convergence_from_max_flow(A, p, q, return_flow_mat=False, flow_func=preflow_push):
     """
     Test whether IPF will converge via max flow algorithm.
     From networkx documentation: "Edges of the graph are expected to have 
@@ -140,7 +144,8 @@ def test_ipf_convergence_from_max_flow(A, p, q, return_flow_mat=False):
     
     # do maximum flow
     ts = time.time()
-    f_val, f_dict = nx.maximum_flow(G, 'source', 'sink')
+    print(flow_func)
+    f_val, f_dict = nx.maximum_flow(G, 'source', 'sink', flow_func=flow_func)
     print('Finished computing max flow [time=%.2fs]' % (time.time()-ts))
     print('Flow value = %.3f, marginal total = %.3f -> equal = %s' % (
         f_val, np.sum(p), np.isclose(f_val, np.sum(p))))
@@ -212,6 +217,7 @@ def find_blocking_row_subset(A, p, q, F=None):
     row_flows = np.sum(F, axis=1)
     below_cap = row_flows < p
     assert below_cap.sum() > 0  # there must be at least one row under capacity
+    print('Found %d rows below capacity' % below_cap.sum())
     first_row = rows[below_cap][0]
     
     # run variant of BFS from this row
@@ -232,6 +238,83 @@ def find_blocking_row_subset(A, p, q, F=None):
             curr_nodes = row_neighbors[~np.isin(row_neighbors, list(seen_rows))]
         layer += 1
     return seen_rows, seen_cols
+
+
+def convert_bipartite_matrix_to_square_matrix(B):
+    """
+    Helper function to convert a bipartite matrix that is m x n into a square matrix 
+    that is (m+n) x (m+n).
+    """
+    m, n = B.shape
+    square = np.zeros((m+n, m+n))
+    square[:m][:, m:] = B
+    square[m:][:, :m] = B.T
+    return square
+
+
+def modify_x(A, p, q, S, epsilon=1e-2, debug=False):
+    """
+    Returns a modified matrix with added edges between rows in S and new non-neighboring columns,
+    so that S is no longer blocking.
+    """
+    # get first eigenvalue and first eigenvectors
+    m, n = A.shape
+    square = convert_bipartite_matrix_to_square_matrix(A)
+    if debug:
+        print(square)
+    w, u, v = eig(square, left=True, right=True)
+    largest = np.argmax(w)
+    smallest = np.argmin(w)
+    assert np.isclose(w[largest], -w[smallest])  # for bipartite graph, first eigenvalue should be -last eigenvalue
+    if debug:
+        print('Largest eigenvalue:', largest)
+    u = u[:, largest]
+    v = v[:, largest]
+    if min(u) < 0:  # from Tong et al., need to ensure that eigenscores are non-negative
+        u = -u
+    if min(v) < 0:
+        v = -v
+    S = list(sorted(S))
+    if debug:
+        print('u of S', u[S])
+    smallest_row = S[np.argmin(u[S])]
+    print('Row with smallest left eigenvector:', smallest_row)
+    
+    # select columns using integer linear program
+    columns = np.arange(n)
+    is_neighbor = np.sum(A[S], axis=0) > 0
+    col_options = columns[~is_neighbor]  # can't be connected to S already
+    if debug:
+        print('Column options:', col_options)
+    marginals = q[col_options]
+    costs = v[m+col_options]
+    remainder = np.sum(p[S]) - np.sum(q[is_neighbor])
+    ts = time.time()
+    prob = LpProblem("select_columns", LpMinimize)
+    variables = [LpVariable(f"col{j}", 0, 1, LpInteger) for j in col_options]
+    prob += lpDot(costs, variables)  # objective to minimize
+    prob += lpDot(marginals, variables) >= remainder  # constraint
+    status = prob.solve()
+    solution = [value(v) for v in variables]
+    print('Finished solving ILP [time=%.2fs]' % (time.time()-ts))
+    
+    # add selected columns to modified X
+    A_mod = A.copy().astype(float)
+    selected = []
+    for j, col in enumerate(col_options):
+        if solution[j] >= 0.99:
+            selected.append(col)
+            A_mod[smallest_row, col] = epsilon
+    print('Selected columns:', selected)
+    
+    # check modified X
+    is_neighbor = np.sum(A_mod[S], axis=0) > 0
+    assert np.sum(p[S]) <= np.sum(q[is_neighbor])  # should no longer be blocking
+    square_mod = convert_bipartite_matrix_to_square_matrix(A_mod)
+    w_mod = eig(square_mod, left=False, right=False)
+    largest_mod = max(w_mod)
+    print('Change in largest eigenvalue: %.4f' % (largest_mod - w[largest]))
+    return A_mod
 
 
 def test_ipf_convergence_from_choice_sets(A, p, q, sort_items=False, apportion_strategy='greedy'):
@@ -423,7 +506,7 @@ def test_unrecoverable_process():
 
     
 ####################################################################
-# Prepare SafeGraph data for IPF
+# Test IPF on SafeGraph mobility data
 ####################################################################
 def prep_safegraph_data_for_ipf(msa_name, dt, msa_df_date_range):
     """
@@ -569,7 +652,7 @@ def print_stats_of_aggregated_matrix(poi_ids, cbg_ids, poi_cbg_props):
         print('Largest connected compomnent: %d POIs, %d CBGs' % (num_pois, len(largest_cc)-num_pois))
     return B
     
-def run_ipf_experiment(msa_name, dt, msa_df_date_range, max_iter=1000):
+def run_safegraph_ipf_experiment(msa_name, dt, msa_df_date_range, max_iter=1000):
     """
     Run IPF on SafeGraph data for given datetime.
     msa_name: name of metropolitan statistical area
@@ -588,7 +671,7 @@ def run_ipf_experiment(msa_name, dt, msa_df_date_range, max_iter=1000):
     with open(fn, 'wb') as f:
         pickle.dump(ipf_out, f)
         
-def run_all_hours_in_day(msa_name, dt):
+def run_safegraph_all_hours_in_day(msa_name, dt):
     """
     Outer function to run IPF for all hours in a given day.
     """
@@ -596,10 +679,218 @@ def run_all_hours_in_day(msa_name, dt):
     for hr in range(24):
         curr_dt = datetime.datetime(year=dt.year, month=dt.month, day=dt.day, hour=hr)
         out_file = 'ipf-output/%s_%s.out' % (msa_name, curr_dt.strftime('%Y-%m-%d-%H'))
-        cmd = f'nohup python -u test_ipf.py {msa_name} --hour {hr} --mode inner > {out_file} 2>&1 &'
+        cmd = f'nohup python -u test_ipf.py safegraph --msa_name {msa_name} --hour {hr} --mode inner > {out_file} 2>&1 &'
         print(cmd)
         os.system(cmd)
         time.sleep(1)
+
+
+####################################################################
+# Test IPF on bikeshare data from CitiBike
+####################################################################
+def prep_bikeshare_data_for_ipf(dt, timeagg='month', hours=None, networks=None):
+    """
+    Prep bikeshare data for IPF.
+    dt: datetime object, with year, month, day, and hour
+    timeagg: how much time to aggregate over
+    """
+    assert (dt >= datetime.datetime(2023, 9, 1)) and (dt < datetime.datetime(2023, 10, 1))
+    assert timeagg in ['month', 'week', 'day']
+    print('Prepping bikeshare data for %s...' % datetime.datetime.strftime(dt, '%Y-%m-%d %H'))
+    if hours is None or networks is None:
+        with open('bikeshare-202309.pkl', 'rb') as f:
+            hours, networks = pickle.load(f)
+    hour_idx = hours.index(dt)
+    true_mat = networks[hour_idx].toarray()
+    p = true_mat.sum(axis=1)  # row marginals
+    q = true_mat.sum(axis=0)  # column marginals
+    N = len(p)
+    
+    # get time-aggregated matrix
+    if timeagg == 'month':
+        start_idx = 0
+        end_idx = len(networks)
+    elif timeagg == 'week':
+        week_idx = hour_idx // 168
+        start_idx = 168 * week_idx
+        end_idx = 168 * (week_idx + 1)
+    else:
+        day_idx = hour_idx // 24
+        start_idx = 24 * day_idx
+        end_idx = 24 * (day_idx + 1)
+    X = 0
+    for mat in networks[start_idx:end_idx]:
+        X += mat
+    nnz = X.count_nonzero()
+    print('Aggregated to %s-level -> %d pairs (%.2f%%)' % (timeagg, nnz, 100 * nnz / (N*N)))
+    X = X.toarray()
+    return X, p, q, true_mat
+
+
+def eval_est_mat(est_mat, real_mat, verbose=True):
+    """
+    Evaluate distance between real matrix and estimated matrix.
+    """
+    if not np.isclose(est_mat.sum(), real_mat.sum()):
+        print('Warning: matrices do not have the same total, off by %.3f' % np.abs(est_mat.sum()-real_mat.sum()))
+    if not np.isclose(real_mat.sum(axis=1), est_mat.sum(axis=1)).all():
+        print('Warning: row marginals don\'t match')
+    if not np.isclose(real_mat.sum(axis=0), est_mat.sum(axis=0)).all():
+        print('Warning: col marginals don\'t match')
+    l2 = np.sqrt(np.sum((est_mat - real_mat) ** 2))
+    norm = np.sqrt(np.sum(real_mat ** 2))
+    if verbose:
+        print('Normalized L2 distance', l2/norm)
+    corr = pearsonr(real_mat.flatten(), est_mat.flatten())
+    if verbose:
+        print('Pearson corr', corr)
+    return l2/norm, corr
+    
+
+def run_bikeshare_ipf_experiment(dt, timeagg='month', max_iter=1000):
+    """
+    Run IPF experiment on bikeshare data.
+    """
+    X, p, q, true_mat = prep_bikeshare_data_for_ipf(dt, timeagg)
+    ts = time.time()
+    ipf_out = do_ipf(X, p, q, num_iter=max_iter)
+    print('Finished IPF: time=%.2fs' % (time.time()-ts))    
+
+    row_factors, col_factors = ipf_out[1], ipf_out[2]
+    est_mat = np.diag(row_factors) @ X @ np.diag(col_factors)
+    print('Comparing real matrix and estimated matrix')
+    eval_est_mat(est_mat, true_mat)
+    
+    fn = 'ipf-output/bikeshare_%s_%s.pkl' % (timeagg, dt.strftime('%Y-%m-%d-%H'))
+    print('Saving results in', fn)
+    with open(fn, 'wb') as f:
+        pickle.dump(ipf_out, f)
+        
+        
+def run_bikeshare_all_hours_in_day(dt, timeagg='month', max_iter=1000):
+    """
+    Outer function to run IPF for all hours in a given day.
+    """
+    print('Running IPF on bikeshare data, all hours on %s...' % dt.strftime('%Y-%m-%d'))
+    for hr in range(24):
+        curr_dt = datetime.datetime(year=dt.year, month=dt.month, day=dt.day, hour=hr)
+        out_file = 'ipf-output/bikeshare_%s_%s.out' % (timeagg, curr_dt.strftime('%Y-%m-%d-%H'))
+        cmd = f'nohup python -u test_ipf.py bikeshare {dt.year} {dt.month} {dt.day} --hour {hr} --timeagg {timeagg} --max_iter {max_iter} --mode inner > {out_file} 2>&1 &'
+        print(cmd)
+        os.system(cmd)
+        time.sleep(1)
+
+        
+def baseline_no_mat(p, q):
+    """
+    Baseline where we ignore time-aggregated matrix and only use marginals.
+    """
+    outer_prod = np.outer(p, q) * 1.0
+    outer_prod /= np.sum(outer_prod)
+    outer_prod *= np.sum(p)  # scale to sum to marginal total
+    assert np.isclose(np.sum(outer_prod, axis=1), p).all()
+    assert np.isclose(np.sum(outer_prod, axis=0), q).all()
+    return outer_prod
+
+def baseline_no_col(X, p):
+    """
+    Baseline where we ignore column marginals and only use X and p.
+    """
+    row_sums = X.sum(axis=1)
+    row_factors = p / row_sums
+    row_factors[row_sums == 0] = 0
+    est_mat = np.diag(row_factors) @ X
+    assert np.isclose(np.sum(est_mat, axis=1), p).all()
+    return est_mat
+
+def baseline_no_row(X, q):
+    """
+    Baseline where we ignore row marginals and only use X and q.
+    """
+    col_sums = X.sum(axis=0)
+    col_factors = q / col_sums
+    col_factors[col_sums == 0] = 0
+    est_mat = X @ np.diag(col_factors)
+    assert np.isclose(np.sum(est_mat, axis=0), q).all()
+    return est_mat
+
+def baseline_scale_mat(X, total):
+    """
+    Baseline where we rescale X so that its total is equal to the hourly total.
+    """
+    curr_total = X.sum()
+    est_mat = X * total / curr_total
+    assert np.isclose(est_mat.sum(), total)
+    return est_mat
+
+def evaluate_results_on_bikeshare(dt, methods=None):
+    """
+    Evaluate results from different methods over 24 hours of bikeshare data for a given day.
+    """
+    assert (dt >= datetime.datetime(2023, 9, 1)) and (dt < datetime.datetime(2023, 10, 1))
+    if methods is None:
+        methods = ['ipf_month', 'ipf_week', 'ipf_day', 
+                   'baseline_no_mat', 'baseline_no_col', 'baseline_no_row',
+                   'baseline_scale_month', 'baseline_scale_week', 'baseline_scale_day']
+    with open('bikeshare-202309.pkl', 'rb') as f:
+        hours, networks = pickle.load(f)
+    
+    Xs = {}
+    Xs['month'] = prep_bikeshare_data_for_ipf(dt, timeagg='month', hours=hours, networks=networks)[0]
+    Xs['week'] = prep_bikeshare_data_for_ipf(dt, timeagg='week', hours=hours, networks=networks)[0]
+    Xs['day'] = prep_bikeshare_data_for_ipf(dt, timeagg='day', hours=hours, networks=networks)[0]
+    l2_dict = {m:[] for m in methods}
+    pearson_dict = {m:[] for m in methods}
+
+    for hr in range(24):
+        curr_dt = datetime.datetime(year=dt.year, month=dt.month, day=dt.day, hour=hr)
+        print('\n', curr_dt.strftime('%Y-%m-%d-%H'))
+        hour_idx = hours.index(curr_dt)
+        true_mat = networks[hour_idx].toarray()
+        p = true_mat.sum(axis=1)  # row marginals
+        q = true_mat.sum(axis=0)  # column marginals
+        for m in methods:
+            est_mat = _get_estimated_matrix(Xs, p, q, curr_dt, m)
+            if est_mat is not None:
+                l2, pearson = eval_est_mat(est_mat, true_mat, verbose=False)
+                print(m, 'L2=%.3f' % l2, 'Pearson r=%.3f (p=%.3f)' % pearson)
+            else:
+                l2, pearson = np.nan, (np.nan, np.nan)
+            l2_dict[m].append(l2)
+            pearson_dict[m].append(pearson[0])
+    return l2_dict, pearson_dict
+                
+                
+def _get_estimated_matrix(Xs, p, q, dt, method):
+    """
+    Helper method to get the estimated matrix for a given hour.
+    """
+    if method.startswith('ipf_'):
+        timeagg = method.split('_', 1)[1]
+        fn = 'ipf-output/bikeshare_%s_%s.pkl' % (timeagg, dt.strftime('%Y-%m-%d-%H'))
+        if os.path.isfile(fn):
+            with open(fn, 'rb') as f:
+                ipf_out = pickle.load(f)
+            row_factors, col_factors = ipf_out[1], ipf_out[2]
+            X = Xs[timeagg]
+            est_mat = np.diag(row_factors) @ X @ np.diag(col_factors)
+        else:
+            print('File is missing:', fn)
+            est_mat = None
+    elif method.startswith('baseline_scale_'):
+        timeagg = method.rsplit('_', 1)[1]
+        X = Xs[timeagg]
+        est_mat = baseline_scale_mat(X, np.sum(p))
+    else:
+        assert method.startswith('baseline_no_')
+        if method == 'baseline_no_mat':
+            est_mat = baseline_no_mat(p, q)
+        elif method == 'baseline_no_col':
+            est_mat = baseline_no_col(Xs['month'], p)
+        else:
+            assert method == 'baseline_no_row'
+            est_mat = baseline_no_row(Xs['month'], q)
+    return est_mat
 
         
 ####################################################################
@@ -793,22 +1084,33 @@ def visualize_ipf_vs_poisson_params(ipf_row_factors, ipf_col_factors, reg_coefs,
     
 if __name__ == '__main__':
     # test_recoverable_process(sparsity_rate=0.8, seed=1)
-#     parser = argparse.ArgumentParser()
-#     parser.add_argument('msa_name', type=str)
-#     parser.add_argument('--hour', default=12, type=int)
-#     parser.add_argument('--max_iter', type=int, default=1000)
-#     parser.add_argument('--mode', default='outer', choices=['outer', 'inner'])
-#     args = parser.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('data', type=str, choices=['safegraph', 'bikeshare'])
+    parser.add_argument('year', type=int, choices=[2020, 2021, 2022, 2023])
+    parser.add_argument('month', type=int, choices=np.arange(1, 13, dtype=int))
+    parser.add_argument('day', type=int, choices=np.arange(1, 32, dtype=int))
+    parser.add_argument('--hour', type=int, default=0, choices=np.arange(0, 25, dtype=int))
+    parser.add_argument('--msa_name', default='Richmond_VA', type=str)  # only for SafeGraph
+    parser.add_argument('--timeagg', default='month', choices=['month', 'week', 'day'], type=str)  # only for bikeshare
+    parser.add_argument('--max_iter', type=int, default=10000)
+    parser.add_argument('--mode', default='outer', choices=['outer', 'inner'])
+    args = parser.parse_args()
+
+    dt = datetime.datetime(args.year, args.month, args.day, args.hour)
+    if args.data == 'safegraph':
+        # hours to try: 2020/03/02 and 2020/04/06
+        if args.mode == 'outer':
+            run_safegraph_all_hours_in_day(args.msa_name, dt)
+        else:
+            # msa_df_date_range = '20191230_20200224'
+            msa_df_date_range = '20200302_20200608'
+            run_safegraph_ipf_experiment(args.msa_name, dt, msa_df_date_range, max_iter=args.max_iter)
+    else:
+        if args.mode == 'outer':
+            run_bikeshare_all_hours_in_day(dt, timeagg=args.timeagg, max_iter=args.max_iter)
+        else:
+            run_bikeshare_ipf_experiment(dt, timeagg=args.timeagg, max_iter=args.max_iter)
     
-#     # dt = datetime.datetime(2020, 3, 2, args.hour)
-#     dt = datetime.datetime(2020, 4, 6, args.hour)  # same two days as in original paper
-#     if args.mode == 'outer':
-#         run_all_hours_in_day(args.msa_name, dt)
-#     else:
-#         # msa_df_date_range = '20191230_20200224'
-#         msa_df_date_range = '20200302_20200608'
-#         run_ipf_experiment(args.msa_name, dt, msa_df_date_range, max_iter=args.max_iter)
-    
-    dt = datetime.datetime(2020, 3, 2, 12)
-    method = 'irls'
-    test_poisson_with_mobility_data(dt, method)
+#     dt = datetime.datetime(2020, 3, 2, 12)
+#     method = 'irls'
+#     test_poisson_with_mobility_data(dt, method)
