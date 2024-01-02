@@ -77,9 +77,6 @@ def generate_hourly_network(X, row_factors, col_factors, model='basic',
         assert F is not None and beta is not None
         means = (np.diag(row_factors) @ X @ np.diag(col_factors)) * (F ** beta)
         Y = np.random.poisson(means)
-    elif model == 'autocorrelated':
-        assert prev_hour is not None and beta is not None
-        # TODO
     else:
         assert model == 'negative_binom'
         # TODO
@@ -517,11 +514,11 @@ def _get_estimated_matrix(Xs, p, q, dt, method):
 
 
 def poisson_regression_on_bikeshare_data(dt, timeagg, model='basic'):
-    assert model in ['basic', 'interaction', 'autocorrelated', 'neg_binom']
     """
     Function to test Poisson regression on bikeshare data. Note: this function takes hours to run,
     since Poisson regression takes very long on large number of parameters.
     """
+    assert model in ['basic', 'interaction', 'neg_binom', 'gravity']
     X, p, q, true_mat = prep_bikeshare_data_for_ipf(dt, timeagg)
     
     # keep submatrix with nonzero row and column marginals
@@ -530,15 +527,17 @@ def poisson_regression_on_bikeshare_data(dt, timeagg, model='basic'):
     nonzero_cols = q > 0
     q = q[nonzero_cols]
     X = X[nonzero_rows][:, nonzero_cols]
+    if model == 'gravity':
+        print('Setting X to all 1s')
+        X = np.ones(X.shape)
     true_mat = true_mat[nonzero_rows][:, nonzero_cols]
     print('Shape without zero marginals:', X.shape, len(p), len(q))
     
-    if model == 'interaction':
-        # provide inverse distance as a feature
+    if model in {'interaction', 'gravity'}:
+        print('Providing distance as feature')
         distances = get_distances_between_stations()
         distances = np.clip(distances, 0.001, None)  # clip so we don't have distance of 0
-        F = 1/distances
-        F = F[nonzero_rows][:, nonzero_cols]
+        F = distances[nonzero_rows][:, nonzero_cols]
     else:
         F = None
     
@@ -647,11 +646,10 @@ if __name__ == "__main__":
     parser.add_argument('month', type=int, choices=np.arange(1, 13, dtype=int))
     parser.add_argument('day', type=int, choices=np.arange(1, 32, dtype=int))
     parser.add_argument('--hour', type=int, default=0, choices=np.arange(0, 25, dtype=int))
-    parser.add_argument('--msa_name', default='Richmond_VA', type=str)  # only for SafeGraph
-    parser.add_argument('--timeagg', default='month', choices=['month', 'week', 'day'], type=str)  # only for bikeshare
-    parser.add_argument('--max_iter', type=int, default=10000)
-    parser.add_argument('--poisson_model', type=str, default='basic', choices=['basic', 'interaction', 
-                                                            'autocorrelated', 'neg_binom'])  # only for mode=poisson
+    parser.add_argument('--msa_name', default='Richmond_VA', type=str)  # only for data=safeGraph
+    parser.add_argument('--timeagg', default='month', choices=['month', 'week', 'day'], type=str)  # only for data=bikeshare
+    parser.add_argument('--max_iter', type=int, default=10000)  # only for ipf mode
+    parser.add_argument('--poisson_model', type=str, default='basic', choices=['basic', 'interaction', 'neg_binom', 'gravity'])  # only for mode=poisson
     args = parser.parse_args()
 
     dt = datetime.datetime(args.year, args.month, args.day, args.hour)
