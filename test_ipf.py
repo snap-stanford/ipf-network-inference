@@ -14,7 +14,7 @@ from pulp import *
 import pickle
 import random
 from scipy.sparse import csr_matrix
-from scipy.linalg import eig
+from scipy.linalg import eig, eigh
 from scipy import optimize
 from scipy.stats import pearsonr, spearmanr
 import statsmodels.api as sm
@@ -54,7 +54,8 @@ def do_ipf(X, p, q, num_iter=1000, start_iter=0, row_factors=None, col_factors=N
         assert row_factors is None and col_factors is None
         row_factors = np.ones(X.shape[0])
         col_factors = np.ones(X.shape[1])
-    print(f'Running IPF for max {num_iter} iterations')
+    if verbose:
+        print(f'Running IPF for max {num_iter} iterations')
     
     all_row_factors = []
     all_col_factors = []
@@ -91,7 +92,8 @@ def do_ipf(X, p, q, num_iter=1000, start_iter=0, row_factors=None, col_factors=N
         if len(all_est_mat) >= 2:
             delta = np.sum(np.abs(all_est_mat[-1] - all_est_mat[-2]))
             if delta < eps:  # converged
-                print(f'Converged; stopping after {i} iterations')
+                if verbose:
+                    print(f'Converged; stopping after {i} iterations')
                 break
             
         # check if stuck in oscillation
@@ -100,7 +102,8 @@ def do_ipf(X, p, q, num_iter=1000, start_iter=0, row_factors=None, col_factors=N
             same2 = np.isclose(all_est_mat[-2], all_est_mat[-4]).all()
             diff_consecutive = ~(np.isclose(all_est_mat[-1], all_est_mat[-2]).all())
             if same1 and same2 and diff_consecutive:
-                print(f'Stuck in oscillation; stopping after {i} iterations')
+                if verbose:
+                    print(f'Stuck in oscillation; stopping after {i} iterations')
                 break                                
         
     if return_all_factors:  # return factors per iteration
@@ -108,6 +111,22 @@ def do_ipf(X, p, q, num_iter=1000, start_iter=0, row_factors=None, col_factors=N
     return i, row_factors, col_factors, row_errs, col_errs
 
 
+def compute_error_bound(X, row_factors, col_factors):
+    """
+    Compute relative bound (without constant) from Theorem 4.2 given X and network parameters.
+    """
+    m, n = X.shape
+    means = np.diag(row_factors) @ X @ np.diag(col_factors)
+    bound = np.sum(means)
+    square = convert_bipartite_matrix_to_square_matrix(X)
+    laplacian = np.diag(np.sum(square, axis=1)) - square
+    # we can use eigh since laplacian is symmetric
+    w = eigh(laplacian, subset_by_index=[1,1], eigvals_only=True)  # ordered from smallest to largest, want second-smallest
+    w = w[0]
+    bound = bound/(w**2)
+    return bound
+    
+    
 def test_ipf_convergence_from_max_flow(X, p, q, return_flow_mat=False, flow_func=preflow_push):
     """
     Test whether IPF will converge via max flow algorithm.
@@ -143,7 +162,6 @@ def test_ipf_convergence_from_max_flow(X, p, q, return_flow_mat=False, flow_func
     
     # do maximum flow
     ts = time.time()
-    print(flow_func)
     f_val, f_dict = nx.maximum_flow(G, 'source', 'sink', flow_func=flow_func)
     print('Finished computing max flow [time=%.2fs]' % (time.time()-ts))
     print('Flow value = %.3f, marginal total = %.3f -> equal = %s' % (
@@ -236,43 +254,98 @@ def find_blocking_row_subset(X, p, q, F=None):
             row_neighbors = rows[row_sum > 0]
             curr_nodes = row_neighbors[~np.isin(row_neighbors, list(seen_rows))]
         layer += 1
+    print('Found blocking set of size', len(seen_rows))
+    
+    seen_rows, seen_cols = list(seen_rows), list(seen_cols)
+    is_neighbor = np.sum(X[seen_rows], axis=0) > 0
+    assert is_neighbor.sum() == len(seen_cols)  # all neighboring columns should've been visited
+    row_total = p[seen_rows].sum()
+    col_total = q[is_neighbor].sum()
+    assert row_total > col_total
+    print('Total row marginal = %.3f, total column marginal = %.3f' % (row_total, col_total))
     return seen_rows, seen_cols
 
 
-def modify_x(X, p, q, S, is_bipartite=True, epsilon=1e-2, debug=False):
+def modify_x_num_edges(X, p, q, S, epsilon=1e-2, tiebreak='largest'):
     """
     Returns a modified matrix with added edges between rows in S and new non-neighboring columns,
-    so that S is no longer blocking.
+    so that S is no longer blocking. Objective: minimize number of edges added.
     """
-    def _convert_bipartite_matrix_to_square_matrix(B):
-        """
-        Helper function to convert a bipartite matrix that is m x n into a square matrix 
-        that is (m+n) x (m+n).
-        """
-        m, n = B.shape
-        square = np.zeros((m+n, m+n))
-        square[:m][:, m:] = B
-        square[m:][:, :m] = B.T
-        return square
+    assert np.isclose(p.sum(), q.sum())
+    assert tiebreak in ['smallest', 'largest']
+    m, n = X.shape
+    columns = np.arange(n)
+    is_neighbor = np.sum(X[S], axis=0) > 0
+    remainder = np.sum(p[S]) - np.sum(q[is_neighbor])
+    col_options = columns[~is_neighbor]  # can't be connected to S already
+    print('Num column options', len(col_options))
+    sorted_cols = sorted(col_options, key=lambda j:q[j], reverse=True)  # sort descending by q_j
+    
+    X_mod = X.copy().astype(float)
+    if tiebreak == 'largest':
+        row = S[np.argmax(p[S])]
+    else:
+        row = S[np.argmin(p[S])]
+    print(f'Row with {tiebreak} p_i:', row)
+    selected = []
+    total = 0
+    for col in sorted_cols:
+        X_mod[row, col] = epsilon
+        selected.append(col)
+        total += q[col]
+        if total > remainder or np.isclose(total, remainder):
+            break
+    assert total > remainder or np.isclose(total, remainder)
+    print('Added top-%d columns:' % len(selected), selected)
+    return X_mod
+    
+    
+def convert_bipartite_matrix_to_square_matrix(B):
+    """
+    Convert a bipartite matrix that is m x n into a square matrix 
+    that is (m+n) x (m+n).
+    """
+    m, n = B.shape
+    square = np.zeros((m+n, m+n))
+    square[:m][:, m:] = B
+    square[m:][:, :m] = B.T
+    return square
 
+def get_largest_eigenvalue_and_eigenvectors(square):
+    """
+    Return a square matrix's largest eigenvalue and corresponding left/right eigenvector.
+    """
+    is_symmetric = (np.isclose(square, square.T)).all()
     # get first eigenvalue and first eigenvectors
+    ts = time.time()
+    if is_symmetric:
+        index = square.shape[0]-1  # ordered from smallest to largest, want last one
+        w, u = eigh(square, subset_by_index=[index,index])  # eigh is much faster
+        w = w[0]
+        u = u.reshape(-1)
+        v = u  # left and right eigenvectors are the same for symmetric matrix
+    else:
+        w, u, v = eig(square, left=True, right=True)
+        largest = np.argmax(w)
+        w = w[largest]
+        u = u[:, largest]
+        v = v[:, largest]
+    print('Found eigenvalues and eigenvectors [time=%.3f]' % (time.time()-ts))
+    return w, u, v
+    
+    
+def modify_x_lambda1(X, p, q, S, is_bipartite=True, epsilon=1e-2, debug=False):
+    """
+    Returns a modified matrix with added edges between rows in S and new non-neighboring columns,
+    so that S is no longer blocking. Objective: minimize change in largest eigenvalue, lambda1.
+    """
     m, n = X.shape
     if is_bipartite:
         square = convert_bipartite_matrix_to_square_matrix(X)
     else:
         square = X
     assert square.shape[0] == square.shape[1]
-    if debug:
-        print(square)
-    w, u, v = eig(square, left=True, right=True)
-    largest = np.argmax(w)
-    smallest = np.argmin(w)
-    if is_bipartite:
-        assert np.isclose(w[largest], -w[smallest])  # for bipartite graph, first eigenvalue should be -last eigenvalue
-    if debug:
-        print('Largest eigenvalue:', largest)
-    u = u[:, largest]
-    v = v[:, largest]
+    w, u, v = get_largest_eigenvalue_and_eigenvectors(square)
     if min(u) < 0:  # from Tong et al., need to ensure that eigenscores are non-negative
         u = -u
     if min(v) < 0:
@@ -309,19 +382,56 @@ def modify_x(X, p, q, S, is_bipartite=True, epsilon=1e-2, debug=False):
             selected.append(col)
             X_mod[smallest_row, col] = epsilon
     print('Selected columns:', selected)
-    
-    # check modified X
     is_neighbor = np.sum(X_mod[S], axis=0) > 0
     assert np.sum(p[S]) <= np.sum(q[is_neighbor])  # should no longer be blocking
+    return X_mod, w, u, v
+
+
+def convergence_algorithm(X, p, q, modify_x):
+    """
+    Our algorithm to achieve IPF convergence.
+    """
+    assert modify_x in ['num_edges_smallest', 'num_edges_largest', 'lambda1']
+    ts = time.time()
+    curr_X = X.copy().astype(float)
+    it = 0
+    w_orig = None
+    while True:
+        print(f'=== ITER {it} ==')
+        G, f_val, F = test_ipf_convergence_from_max_flow(curr_X, p, q, return_flow_mat=True)
+        if np.isclose(np.sum(p), f_val):
+            print('Finished convergence algorithm [total time=%.3fs]' % (time.time()-ts))
+            return curr_X, w_orig
+        S, _ = find_blocking_row_subset(curr_X, p, q, F=F)
+        if modify_x == 'num_edges_smallest':
+            curr_X = modify_x_num_edges(curr_X, p, q, S, tiebreak='smallest')
+        elif modify_x == 'num_edges_largest':
+            curr_X = modify_x_num_edges(curr_X, p, q, S, tiebreak='largest')
+        else:
+            curr_X, w, u, v = modify_x_lambda1(curr_X, p, q, S)
+            if it == 0:
+                w_orig = w  # save original lambda_1
+        print()
+        it += 1
+        
+def evaluate_change_in_x(X_orig, X_mod, w_orig, is_bipartite=True):
+    """
+    Compare original X and modified X on number of edges and largest eigenvalue.
+    """
+    nonzero_orig = X_orig > 0
+    nonzero_mod = X_mod > 0
+    assert nonzero_mod[nonzero_orig].all()  # all original nonzero entries should remain nonzero
+    num_edges = (nonzero_mod & (~nonzero_orig)).sum()
+    print('Number of new edges:', num_edges)
+    
     if is_bipartite:
         square_mod = convert_bipartite_matrix_to_square_matrix(X_mod)
     else:
         square_mod = X_mod
-    w_mod = eig(square_mod, left=False, right=False)
-    largest_mod = max(w_mod)
-    print('Change in largest eigenvalue: %.4f' % (largest_mod - w[largest]))
-    return X_mod
-
+    w_mod, _, _ = get_largest_eigenvalue_and_eigenvectors(square_mod)
+    print('Change in largest eigenvalue', w_mod - w_orig)
+    return num_edges, w_mod-w_orig
+    
 
 ####################################################################
 # Compare IPF to Poisson regression
