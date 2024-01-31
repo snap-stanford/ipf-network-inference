@@ -461,9 +461,10 @@ def run_poisson_experiment(X, p, q, Y=None, F=None, method='IRLS'):
     print('Constructed one-hot mat:', onehots.shape)
     
     # construct explanatory variables
-    if F is not None:  # add interaction feature
-        log_f = np.log(F[row_nnz, col_nnz]).reshape(len(onehots), 1)
-        explain_vars = np.concatenate([onehots, log_f], axis=1)
+    if F is not None:  # add interaction feature as f^alpha exp(-f * beta)
+        feat = F[row_nnz, col_nnz].reshape(len(onehots), 1)
+        log_feat = np.log(feat)
+        explain_vars = np.concatenate([onehots, feat, log_feat], axis=1)
     else:
         explain_vars = onehots
     print('Constructed explanatory variables:', explain_vars.shape)
@@ -484,7 +485,7 @@ def run_poisson_experiment(X, p, q, Y=None, F=None, method='IRLS'):
     mdl = sm.GLM(resp, explain_vars, offset=offset, family=sm.families.Poisson())
     print('Initialized Poisson model [time=%.3fs]' % (time.time()-ts))
     ts = time.time()
-    result = mdl.fit(method=method, maxiter=1000)
+    result = mdl.fit(method=method)
     print('Finished fitting model with statsmodels, method %s [time=%.3fs]' % (method, time.time()-ts))
     return mdl, result
     

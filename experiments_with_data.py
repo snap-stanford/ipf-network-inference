@@ -17,7 +17,9 @@ from scipy.sparse import csr_matrix
 from scipy.linalg import eig
 from scipy import optimize
 from scipy.stats import pearsonr, spearmanr
+from scipy.optimize import curve_fit
 from sklearn.metrics import pairwise_distances
+from sklearn.metrics.pairwise import cosine_similarity
 import statsmodels.api as sm
 import time
 
@@ -63,24 +65,63 @@ def generate_row_and_col_factors(m, n, seed=0, scalar=4):
     col_factors = np.random.rand(n) * scalar
     return row_factors, col_factors
     
-def generate_hourly_network(X, row_factors, col_factors, model='basic',
-                            F=None, beta=None, prev_hour=None, seed=0):
+def generate_hourly_network(X, row_factors, col_factors, model='basic', seed=0,
+                            gamma=None, D=None, alpha=None, beta=None):
     """
     Generate hourly network based on time-aggregated network X and hourly row/column factors,
-    and potentially other information. 'model' defines which model is being used.
+    and potentially other information. model defines which model is being used.
+    """
+    assert model in ['basic', 'exp', 'nb', 'mult', 'interaction']
+    np.random.seed(seed)
+    means = np.diag(row_factors) @ X @ np.diag(col_factors)  # original expected values
+    if model == 'basic':  # biproportional Poisson
+        Y = np.random.poisson(means)
+    elif model == 'exp':  # exponential
+        Y = np.random.exponential(means)
+    elif model == 'nb':  # negative binomial
+        assert gamma is not None
+        n_successes = (gamma * means) / (1-gamma)
+        Y = np.random.negative_binomial(n_successes, gamma)
+    elif model == 'mult':  # multinomial
+        N = np.random.poisson(np.sum(means))
+        probs = means / np.sum(means)
+        Y = np.random.multinomial(N, probs.flatten()).reshape(X.shape)
+    else:
+        assert model == 'interaction'
+        assert D is not None and alpha is not None and beta is not None
+        new_means = means * (D ** alpha) * np.exp(-D * beta)
+        old_total = np.sum(means)
+        new_total = np.sum(new_means)
+        Y = np.random.poisson(new_means * (old_total / new_total))
+    return Y
+
+def generate_distance_mat(m, n, seed=0):
+    """
+    Generate positions and distance matrix.
     """
     np.random.seed(seed)
-    if model == 'basic':
-        means = np.diag(row_factors) @ X @ np.diag(col_factors)
-        Y = np.random.poisson(means)
-    elif model == 'interaction':
-        assert F is not None and beta is not None
-        means = (np.diag(row_factors) @ X @ np.diag(col_factors)) * (F ** beta)
-        Y = np.random.poisson(means)
-    else:
-        assert model == 'negative_binom'
-        # TODO
-    return Y
+    row_pos = np.random.rand(m, 2)
+    col_pos = np.random.rand(n, 2)
+    dist = pairwise_distances(row_pos, col_pos)
+    return dist
+    
+
+def do_ipf_and_eval(X, Y, normalized_expu, normalized_expv):
+    """
+    Run IPF and return 1) num iterations, 2) l2 distance to true network parameters, and 3) cosine similarity
+    to true network.
+    """
+    i, row_factors, col_factors, row_errs, col_errs = do_ipf(X, Y.sum(axis=1), Y.sum(axis=0), verbose=False)
+    if (row_errs[-1] + col_errs[-1]) > 1e-6:
+        print('Warning: did not converge')
+    row_factors = row_factors / np.mean(row_factors)
+    col_factors = col_factors / np.mean(col_factors)
+    row_diffs = row_factors - normalized_expu  # row-wise subtraction
+    col_diffs = col_factors - normalized_expv
+    l2 = np.sqrt(np.sum(row_diffs ** 2) + np.sum(col_diffs ** 2))
+    est_mat = np.diag(row_factors) @ X @ np.diag(col_factors)
+    cossim = np.dot(Y.flatten(), est_mat.flatten()) / (l2_norm(Y) * l2_norm(est_mat))
+    return i, l2, cossim
 
 
 ####################################################################
@@ -262,7 +303,41 @@ def run_safegraph_all_hours_in_day(msa_name, dt):
         os.system(cmd)
         time.sleep(1)
         
-        
+def compare_convergence_algorithms(X, p, q, epsilon=0.01):
+    """
+    Test convergence algorithms on inputs X, p, and q.
+    """
+    # baseline method: replace all zeros with small values
+    X_mods = {}
+    X_mod = X.copy().astype(float)
+    X_mod = np.clip(X_mod, epsilon, None)
+    X_mods['baseline'] = X_mod
+    
+    print('Objective: minimize number of edges, using row with largest p_i')
+    X_mod, _ = convergence_algorithm(X, p, q, 'num_edges_largest')
+    X_mods['num_edges_largest'] = X_mod
+    
+    print('\nObjective: minimize number of edges, using row with smallest p_i')
+    X_mod, _ = convergence_algorithm(X, p, q, 'num_edges_smallest')
+    X_mods['num_edges_smallest'] = X_mod
+    
+    print('\nObjective: minimize change in lambda1')
+    X_mod, w_orig = convergence_algorithm(X, p, q, 'lambda1')
+    X_mods['change_in_lambda1'] = X_mod
+    
+    print('\nEvaluating change in X...')
+    results = {}
+    for key, X_mod in X_mods.items():
+        print('METHOD:', key)
+        num_edges, change_in_lambda1 = evaluate_change_in_x(X, X_mod, w_orig)
+        results[key] = (num_edges, change_in_lambda1)
+        if key != 'baseline':
+            print('Baseline/method: num edges = %.2fx, change in lambda1 = %.2fx' % (
+                results['baseline'][0]/num_edges, results['baseline'][1]/change_in_lambda1))
+        print()
+    return X_mods, results
+    
+    
 def poisson_regression_on_safegraph_data(dt, method):
     """
     Function to test Poisson regression on SafeGraph data. Note: this function takes hours to run,
@@ -341,6 +416,33 @@ def get_distances_between_stations():
     pairwise_dist = pairwise_distances(locations)
     return pairwise_dist
 
+def dist_func(d, a, b):
+    """
+    Number of bike trips as a function of distance. Functional form from Navick and Furth (1994).
+    """
+    return d**a * np.exp(-d * b)
+
+def fit_distance_function(X, max_dist=0.25):
+    """
+    Fit distance function on observed distances and number of trips between station pairs.
+    """
+    distances = get_distances_between_stations()
+    assert distances.shape == X.shape
+    assert np.sum(np.isclose(distances, 0)) == distances.shape[0]
+    min_nonzero = np.min(distances[distances > 0])
+    distances = np.clip(distances, min_nonzero/2, None)  # fill zeros with epsilon
+    
+    mids = []
+    trips = []
+    interval = 0.001
+    for start in np.arange(0, max_dist+interval, interval):
+        end = start+interval
+        in_range = (distances >= start) & (distances < end)
+        mids.append(np.mean([start, end]))  # midpoint of interval
+        trips.append(np.mean(X[in_range]))
+    params, _ = curve_fit(dist_func, mids, trips)
+    print('Estimated distance parameters: alpha=%.4f, beta=%.4f' % (params[0], params[1]))
+    return distances, params
     
 def l2_norm(mat):
     """
@@ -364,14 +466,21 @@ def eval_est_mat(est_mat, real_mat, verbose=True):
     corr = pearsonr(real_mat.flatten(), est_mat.flatten())
     if verbose:
         print('Pearson corr', corr)
-    return norm_l2, corr
-    
+    cossim = np.dot(real_mat.flatten(), est_mat.flatten()) / (l2_norm(real_mat) * l2_norm(est_mat))
+    if verbose:
+        print('Cosine sim', cossim)
+    return norm_l2, corr, cossim
 
-def run_bikeshare_ipf_experiment(dt, timeagg='month', max_iter=1000):
+def run_bikeshare_ipf_experiment(dt, timeagg='month', use_gravity=False, max_iter=1000):
     """
     Run IPF experiment on bikeshare data.
     """
     X, p, q, true_mat = prep_bikeshare_data_for_ipf(dt, timeagg)
+    if use_gravity:
+        print('Fitting IPF gravity model: replacing X with distance mat')
+        distances, params = fit_distance_function(X)
+        X = dist_func(distances, params[0], params[1])
+        
     ts = time.time()
     ipf_out = do_ipf(X, p, q, num_iter=max_iter)
     print('Finished IPF: time=%.2fs' % (time.time()-ts))    
@@ -381,21 +490,27 @@ def run_bikeshare_ipf_experiment(dt, timeagg='month', max_iter=1000):
     print('Comparing real matrix and estimated matrix')
     eval_est_mat(est_mat, true_mat)
     
-    fn = 'ipf-output/bikeshare_%s_%s.pkl' % (timeagg, dt.strftime('%Y-%m-%d-%H'))
+    if use_gravity:
+        fn = 'ipf-output/bikeshare_%s_gravity_%s.pkl' % (timeagg, dt.strftime('%Y-%m-%d-%H'))
+    else:
+        fn = 'ipf-output/bikeshare_%s_%s.pkl' % (timeagg, dt.strftime('%Y-%m-%d-%H'))
     print('Saving results in', fn)
     with open(fn, 'wb') as f:
         pickle.dump(ipf_out, f)
         
         
-def run_bikeshare_all_hours_in_day(dt, timeagg='month', max_iter=1000):
+def run_bikeshare_all_hours_in_day(dt, timeagg='month', use_gravity=False, max_iter=1000):
     """
     Outer function to run IPF for all hours in a given day.
     """
     print('Running IPF on bikeshare data, all hours on %s...' % dt.strftime('%Y-%m-%d'))
     for hr in range(24):
         curr_dt = datetime.datetime(year=dt.year, month=dt.month, day=dt.day, hour=hr)
-        out_file = 'ipf-output/bikeshare_%s_%s.out' % (timeagg, curr_dt.strftime('%Y-%m-%d-%H'))
-        cmd = f'nohup python -u experiments_with_data.py ipf_single_hour bikeshare {dt.year} {dt.month} {dt.day} --hour {hr} --timeagg {timeagg} --max_iter {max_iter} > {out_file} 2>&1 &'
+        if use_gravity:
+            out_file = 'ipf-output/bikeshare_%s_gravity_%s.out' % (timeagg, curr_dt.strftime('%Y-%m-%d-%H'))
+        else:
+            out_file = 'ipf-output/bikeshare_%s_%s.out' % (timeagg, curr_dt.strftime('%Y-%m-%d-%H'))
+        cmd = f'nohup python -u experiments_with_data.py ipf_single_hour bikeshare {dt.year} {dt.month} {dt.day} --hour {hr} --timeagg {timeagg} --ipf_gravity {int(use_gravity)} --max_iter {max_iter} > {out_file} 2>&1 &'
         print(cmd)
         os.system(cmd)
         time.sleep(1)
@@ -449,7 +564,7 @@ def evaluate_results_on_bikeshare(dt, methods=None):
     """
     assert (dt >= datetime.datetime(2023, 9, 1)) and (dt < datetime.datetime(2023, 10, 1))
     if methods is None:
-        methods = ['ipf_month', 'ipf_week', 'ipf_day', 
+        methods = ['ipf_month', 'ipf_week', 'ipf_day', 'gravity',
                    'baseline_no_mat', 'baseline_no_col', 'baseline_no_row',
                    'baseline_scale_month', 'baseline_scale_week', 'baseline_scale_day']
     with open('bikeshare-202309.pkl', 'rb') as f:
@@ -459,8 +574,12 @@ def evaluate_results_on_bikeshare(dt, methods=None):
     Xs['month'] = prep_bikeshare_data_for_ipf(dt, timeagg='month', hours=hours, networks=networks)[0]
     Xs['week'] = prep_bikeshare_data_for_ipf(dt, timeagg='week', hours=hours, networks=networks)[0]
     Xs['day'] = prep_bikeshare_data_for_ipf(dt, timeagg='day', hours=hours, networks=networks)[0]
+    if 'gravity' in methods:
+        distances, params = fit_distance_function(Xs['month'])
+        Xs['distance'] = dist_func(distances, params[0], params[1])
     l2_dict = {m:[] for m in methods}
     pearson_dict = {m:[] for m in methods}
+    cosine_dict = {m:[] for m in methods}
 
     for hr in range(24):
         curr_dt = datetime.datetime(year=dt.year, month=dt.month, day=dt.day, hour=hr)
@@ -472,22 +591,27 @@ def evaluate_results_on_bikeshare(dt, methods=None):
         for m in methods:
             est_mat = _get_estimated_matrix(Xs, p, q, curr_dt, m)
             if est_mat is not None:
-                l2, pearson = eval_est_mat(est_mat, true_mat, verbose=False)
-                print(m, 'L2=%.3f' % l2, 'Pearson r=%.3f (p=%.3f)' % pearson)
+                l2, (r,_), cossim = eval_est_mat(est_mat, true_mat, verbose=False)
+                print(m, 'L2=%.3f, Pearson r=%.3f, cosine sim=%.3f' % (l2, r, cossim))
             else:
-                l2, pearson = np.nan, (np.nan, np.nan)
+                l2, r = np.nan, np.nan
             l2_dict[m].append(l2)
-            pearson_dict[m].append(pearson[0])
-    return l2_dict, pearson_dict
+            pearson_dict[m].append(r)
+            cosine_dict[m].append(cossim)
+    return l2_dict, pearson_dict, cosine_dict
                 
                 
 def _get_estimated_matrix(Xs, p, q, dt, method):
     """
     Helper method to get the estimated matrix for a given hour.
     """
-    if method.startswith('ipf_'):
-        timeagg = method.split('_', 1)[1]
-        fn = 'ipf-output/bikeshare_%s_%s.pkl' % (timeagg, dt.strftime('%Y-%m-%d-%H'))
+    if method.startswith('ipf_') or method == 'gravity':
+        if method.startswith('ipf_'):
+            timeagg = method.split('_', 1)[1]
+            fn = 'ipf-output/bikeshare_%s_%s.pkl' % (timeagg, dt.strftime('%Y-%m-%d-%H'))
+        else:
+            timeagg = 'distance'
+            fn = 'ipf-output/bikeshare_month_gravity_%s.pkl' % dt.strftime('%Y-%m-%d-%H')
         if os.path.isfile(fn):
             with open(fn, 'rb') as f:
                 ipf_out = pickle.load(f)
@@ -518,7 +642,7 @@ def poisson_regression_on_bikeshare_data(dt, timeagg, model='basic'):
     Function to test Poisson regression on bikeshare data. Note: this function takes hours to run,
     since Poisson regression takes very long on large number of parameters.
     """
-    assert model in ['basic', 'interaction', 'neg_binom', 'gravity']
+    assert model in ['basic', 'interaction', 'gravity']
     X, p, q, true_mat = prep_bikeshare_data_for_ipf(dt, timeagg)
     
     # keep submatrix with nonzero row and column marginals
@@ -646,10 +770,11 @@ if __name__ == "__main__":
     parser.add_argument('month', type=int, choices=np.arange(1, 13, dtype=int))
     parser.add_argument('day', type=int, choices=np.arange(1, 32, dtype=int))
     parser.add_argument('--hour', type=int, default=0, choices=np.arange(0, 25, dtype=int))
-    parser.add_argument('--msa_name', default='Richmond_VA', type=str)  # only for data=safeGraph
+    parser.add_argument('--msa_name', default='Richmond_VA', type=str)  # only for data=safegraph
     parser.add_argument('--timeagg', default='month', choices=['month', 'week', 'day'], type=str)  # only for data=bikeshare
+    parser.add_argument('--ipf_gravity', type=int, default=0, choices=[0, 1])  # only for ipf mode
     parser.add_argument('--max_iter', type=int, default=10000)  # only for ipf mode
-    parser.add_argument('--poisson_model', type=str, default='basic', choices=['basic', 'interaction', 'neg_binom', 'gravity'])  # only for mode=poisson
+    parser.add_argument('--poisson_model', type=str, default='basic', choices=['basic', 'interaction', 'gravity'])  # only for mode=poisson
     args = parser.parse_args()
 
     dt = datetime.datetime(args.year, args.month, args.day, args.hour)
@@ -666,8 +791,8 @@ if __name__ == "__main__":
             poisson_regression_on_safegraph_data(dt, 'IRLS')
     else:
         if args.mode == 'ipf_all_hours':
-            run_bikeshare_all_hours_in_day(dt, args.timeagg, args.max_iter)
+            run_bikeshare_all_hours_in_day(dt, args.timeagg, args.ipf_gravity==1, args.max_iter)
         elif args.mode == 'ipf_single_hour':
-            run_bikeshare_ipf_experiment(dt, args.timeagg, args.max_iter)
+            run_bikeshare_ipf_experiment(dt, args.timeagg, args.ipf_gravity==1, args.max_iter)
         else:
             poisson_regression_on_bikeshare_data(dt, args.timeagg, model=args.poisson_model)
