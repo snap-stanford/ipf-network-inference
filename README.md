@@ -1,6 +1,6 @@
 # IPF for dynamic network inference
 
-This respository contains code to run all experiments for "Inferring dynamic networks from marginals with iterative proportional fitting". The main files are:
+This respository contains code to run all experiments for "Inferring dynamic networks from marginals with iterative proportional fitting" by Serina Chang*, Frederic Koehler*, Zhaonan Qu*, Jure Leskovec, and Johan Ugander, published in ICML 2024. The main files are:
 
 - **test_ipf.py**: functions to run IPF, test and enable IPF convergence (our ConvIPF algorithm), and run the equivalent Poisson regression.
 - **experiments_with_data.py**: functions to run experiments with data - synthetic data, SafeGraph mobility data, and CitiBike bikeshare data
